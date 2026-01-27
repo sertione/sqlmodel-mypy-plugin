@@ -713,6 +713,7 @@ def test_model_construct_signature_hook() -> None:
 
 def test_class_attribute_hook_wraps_to_instrumented_attribute() -> None:
     model_info = make_sqlmodel_class("m.User")
+    model_info.defn.keywords["table"] = NameExpr("True")
 
     int_info = make_typeinfo("builtins.int")
     int_t = Instance(int_info, [])
@@ -744,6 +745,31 @@ def test_class_attribute_hook_wraps_to_instrumented_attribute() -> None:
     t = hook(ctx)
     assert isinstance(t, Instance)
     assert t.type.fullname == "sqlalchemy.orm.attributes.InstrumentedAttribute"
+
+
+def test_class_attribute_hook_skips_non_table_models() -> None:
+    model_info = make_sqlmodel_class("m.User")
+
+    int_info = make_typeinfo("builtins.int")
+    int_t = Instance(int_info, [])
+    var = Var("x", int_t)
+    model_info.names["x"] = SymbolTableNode(0, var)
+    stmt = plugin_mod.AssignmentStmt([NameExpr("x")], make_call(plugin_mod.SQLMODEL_FIELD_FULLNAME))
+    stmt.new_syntax = True
+    model_info.defn.defs.body.append(stmt)
+
+    inst_attr_info = make_typeinfo("sqlalchemy.orm.attributes.InstrumentedAttribute")
+
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    p.lookup_fully_qualified = lambda full: SimpleNamespace(  # type: ignore[method-assign]
+        node={
+            "m.User": model_info,
+            "sqlalchemy.orm.attributes.InstrumentedAttribute": inst_attr_info,
+        }.get(full)
+    )
+
+    hook = p.get_class_attribute_hook("m.User.x")
+    assert hook is None
 
 
 def test_col_function_hook_returns_mapped_value_type() -> None:

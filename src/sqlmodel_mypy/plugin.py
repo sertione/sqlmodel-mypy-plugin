@@ -80,11 +80,12 @@ SQLALCHEMY_SELECT_OUTERJOIN_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.outerjoin"
 SQLALCHEMY_SELECT_OUTERJOIN_FROM_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.outerjoin_from"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 5
+__version__ = 6
 
 
 class _CollectedField(NamedTuple):
     name: str
+    aliases: tuple[str, ...]
     has_default: bool
     line: int
     column: int
@@ -249,6 +250,8 @@ class SQLModelMypyPlugin(Plugin):
             return None
         if not owner_info.has_base(SQLMODEL_BASEMODEL_FULLNAME):
             return None
+        if not _is_table_model(owner_info):
+            return None
 
         if not self._declares_sqlmodel_member(owner_info, attr_name):
             return None
@@ -408,6 +411,7 @@ class SQLModelMypyPlugin(Plugin):
             return None
 
         has_default = SQLModelTransformer.get_has_default(stmt)
+        aliases = tuple(SQLModelTransformer.get_field_aliases(stmt))
         init_type = sym.node.type
         if init_type is not None and defining_info is not current_info:
             with state.strict_optional_set(api.options.strict_optional):
@@ -415,6 +419,7 @@ class SQLModelMypyPlugin(Plugin):
 
         return _CollectedField(
             name=name,
+            aliases=aliases,
             has_default=has_default,
             line=stmt.line,
             column=stmt.column,
@@ -431,18 +436,30 @@ class SQLModelMypyPlugin(Plugin):
         arg_kinds: list[ArgKind] = []
 
         typed = self.plugin_config.init_typed
+        table_model = _is_table_model(info)
 
+        canonical_names = {f.name for f in fields}
+        if table_model:
+            canonical_names.update(rel.name for rel in relationships)
+        if not self.plugin_config.init_forbid_extra:
+            canonical_names.add("kwargs")
+
+        field_params: list[tuple[Type, list[str]]] = []
         for f in fields:
             if typed and f.type is not None:
                 t = f.type.accept(ForceInvariantTypeVars())
                 t = _unwrap_mapped_type(t)
             else:
                 t = AnyType(TypeOfAny.explicit)
+            field_aliases = [
+                alias for alias in f.aliases if alias != f.name and alias not in canonical_names
+            ]
             arg_types.append(t)
             arg_names.append(f.name)
-            arg_kinds.append(ARG_NAMED_OPT if f.has_default else ARG_NAMED)
+            arg_kinds.append(ARG_NAMED_OPT if f.has_default or field_aliases else ARG_NAMED)
+            field_params.append((t, field_aliases))
 
-        if _is_table_model(info):
+        if table_model:
             for rel in relationships:
                 if typed and rel.type is not None:
                     t = rel.type.accept(ForceInvariantTypeVars())
@@ -451,6 +468,16 @@ class SQLModelMypyPlugin(Plugin):
                     t = AnyType(TypeOfAny.explicit)
                 arg_types.append(t)
                 arg_names.append(rel.name)
+                arg_kinds.append(ARG_NAMED_OPT)
+
+        used_names = set(canonical_names)
+        for t, field_aliases in field_params:
+            for alias in field_aliases:
+                if alias in used_names:
+                    continue
+                used_names.add(alias)
+                arg_types.append(t)
+                arg_names.append(alias)
                 arg_kinds.append(ARG_NAMED_OPT)
 
         if not self.plugin_config.init_forbid_extra:
@@ -496,6 +523,15 @@ class SQLModelMypyPlugin(Plugin):
         arg_names: list[str | None] = ["_fields_set"]
         arg_kinds: list[ArgKind] = [ARG_OPT]
 
+        table_model = _is_table_model(receiver_info)
+        canonical_names = {f.name for f in fields}
+        if table_model:
+            canonical_names.update(rel.name for rel in relationships)
+        canonical_names.add("_fields_set")
+        if not self.plugin_config.init_forbid_extra:
+            canonical_names.add("kwargs")
+
+        field_params: list[tuple[Type, list[str]]] = []
         for f in fields:
             t = (
                 f.type.accept(ForceInvariantTypeVars())
@@ -503,11 +539,15 @@ class SQLModelMypyPlugin(Plugin):
                 else AnyType(TypeOfAny.explicit)
             )
             t = _unwrap_mapped_type(t)
+            field_aliases = [
+                alias for alias in f.aliases if alias != f.name and alias not in canonical_names
+            ]
             arg_types.append(t)
             arg_names.append(f.name)
-            arg_kinds.append(ARG_NAMED_OPT if f.has_default else ARG_NAMED)
+            arg_kinds.append(ARG_NAMED_OPT if f.has_default or field_aliases else ARG_NAMED)
+            field_params.append((t, field_aliases))
 
-        if _is_table_model(receiver_info):
+        if table_model:
             for rel in relationships:
                 t = (
                     rel.type.accept(ForceInvariantTypeVars())
@@ -517,6 +557,16 @@ class SQLModelMypyPlugin(Plugin):
                 t = _unwrap_mapped_type(t)
                 arg_types.append(t)
                 arg_names.append(rel.name)
+                arg_kinds.append(ARG_NAMED_OPT)
+
+        used_names = set(canonical_names)
+        for t, field_aliases in field_params:
+            for alias in field_aliases:
+                if alias in used_names:
+                    continue
+                used_names.add(alias)
+                arg_types.append(t)
+                arg_names.append(alias)
                 arg_kinds.append(ARG_NAMED_OPT)
 
         if not self.plugin_config.init_forbid_extra:

@@ -58,7 +58,7 @@ errors for documented patterns.
     pattern (and keep types conservative).
   - Update/add mypy integration tests to match the chosen strategy.
 
-## v0.5 (Model-kind awareness + reduce “surprising” typing)
+## v0.5 (Model-kind awareness + reduce “surprising” typing) - DONE
 
 - **Table-model awareness for SQLAlchemy expression typing**
   - Only treat class attributes as SQLAlchemy expressions (e.g. wrap to `InstrumentedAttribute[T]`) for `table=True`

@@ -4,11 +4,18 @@ Mypy plugin that improves type checking for [`SQLModel`](https://github.com/fast
 
 ## Status
 
-Early/experimental. Current scope:
+Early/experimental. Implemented scope (supported today):
 
-- Generate correct `__init__` / `model_construct` signatures for SQLModel models (treat `sqlmodel.Field(...)`
-  required/optional correctly; accept `sqlmodel.Relationship(...)` kwargs for `table=True` models).
-- Improve SQLAlchemy expression typing for **class** attribute access (e.g. `User.id`, `User.name`).
+Planned work is tracked in [`ROADMAP.md`](ROADMAP.md).
+
+- Generate correct `__init__` / `model_construct` signatures for SQLModel models:
+  - treat `sqlmodel.Field(...)` required/optional correctly
+  - accept `sqlmodel.Relationship(...)` kwargs for `table=True` models
+  - accept common `Field(...)` alias kwargs (`alias` / `validation_alias`) when statically known
+- Improve SQLAlchemy expression typing for **class** attribute access on `table=True` models (e.g. `User.id`,
+  `User.name`, `Team.heroes`).
+- Outer-join `None` propagation in `select(A, B).join(B, isouter=True)` result tuples.
+- Compatible with `pydantic.mypy` in either plugin order.
 
 ## Install (dev)
 
@@ -68,18 +75,31 @@ warn_untyped_fields = true
 
 ## SQL expression typing
 
-This plugin adjusts **class attribute** types on SQLModel models to behave like SQLAlchemy expressions, so you can
-write queries without `col()`:
+This plugin adjusts **class attribute** types on `table=True` SQLModel models to behave like SQLAlchemy
+expressions, so you can write queries without `col()`:
 
 ```py
 from sqlmodel import Field, SQLModel, select
 
-class User(SQLModel):
+class User(SQLModel, table=True):
     id: int = Field(primary_key=True)
     name: str = Field()
 
 stmt = select(User).where(User.name.like("%x%"))
 ```
+
+## Field aliases in constructor kwargs
+
+If you use `Field(alias=...)` (or `validation_alias=...` / `schema_extra={"validation_alias": ...}`), the plugin
+adds the alias name as an accepted keyword argument in generated `__init__` / `model_construct` signatures.
+This avoids false-positive “unexpected keyword argument” errors when `init_forbid_extra=true`.
+
+Limitations:
+
+- Only **string-literal** aliases are recognized (e.g. `Field(alias=\"full_name\")`).
+- Aliases that are not valid Python identifiers (or that collide with other parameter names) are ignored.
+- Mypy can’t express “either field name or alias is required”, so aliased required fields may not be reported as
+  missing at type-check time.
 
 ## Development
 

@@ -9,6 +9,7 @@ This module is intentionally small and focused:
 
 from __future__ import annotations
 
+import keyword
 from collections.abc import Iterator
 from typing import Any, Protocol
 
@@ -28,6 +29,7 @@ from mypy.nodes import (
     CallExpr,
     ClassDef,
     Decorator,
+    DictExpr,
     EllipsisExpr,
     Expression,
     FuncDef,
@@ -37,6 +39,7 @@ from mypy.nodes import (
     PlaceholderNode,
     RefExpr,
     Statement,
+    StrExpr,
     SymbolTableNode,
     TempNode,
     TypeAlias,
@@ -109,6 +112,7 @@ class SQLModelField:
         has_default: bool,
         line: int,
         column: int,
+        aliases: list[str] | None = None,
         type: Type | None,
         info: TypeInfo,
     ) -> None:
@@ -116,6 +120,7 @@ class SQLModelField:
         self.has_default = has_default
         self.line = line
         self.column = column
+        self.aliases = list(aliases or [])
         self.type = type
         self.info = info
 
@@ -150,6 +155,7 @@ class SQLModelField:
             "has_default": self.has_default,
             "line": self.line,
             "column": self.column,
+            "aliases": self.aliases,
             "type": self.type.serialize(),
         }
 
@@ -158,9 +164,23 @@ class SQLModelField:
         cls, info: TypeInfo, data: JsonDict, api: SemanticAnalyzerPluginInterface
     ) -> SQLModelField:
         data = data.copy()
+        aliases = data.pop("aliases", [])
+        if isinstance(aliases, list):
+            deduped: list[str] = []
+            seen = set()
+            for alias in aliases:
+                if not isinstance(alias, str):
+                    continue
+                if alias in seen:
+                    continue
+                seen.add(alias)
+                deduped.append(alias)
+            aliases = deduped
+        else:
+            aliases = []
         typ = deserialize_and_fixup_type(data.pop("type"), api)
         name = data.pop("name")
-        return cls(name=name, type=typ, info=info, **data)
+        return cls(name=name, type=typ, aliases=aliases, info=info, **data)
 
     def expand_typevar_from_subtype(
         self, sub_type: TypeInfo, api: SemanticAnalyzerPluginInterface
@@ -414,6 +434,7 @@ class SQLModelTransformer:
             return None
 
         has_default = self.get_has_default(stmt)
+        aliases = self.get_field_aliases(stmt)
         init_type = node.type
 
         return SQLModelField(
@@ -421,6 +442,7 @@ class SQLModelTransformer:
             has_default=has_default,
             line=stmt.line,
             column=stmt.column,
+            aliases=aliases,
             type=init_type,
             info=self._cls.info,
         )
@@ -446,6 +468,70 @@ class SQLModelTransformer:
 
         return True
 
+    @staticmethod
+    def get_field_aliases(stmt: AssignmentStmt) -> list[str]:
+        """Best-effort collection of Field() alias names usable as constructor kwargs.
+
+        Mirrors SQLModel's precedence for validation aliases:
+        `validation_alias` > `schema_extra["validation_alias"]` > `alias`.
+
+        We currently only expose aliases that are statically known string literals and are valid
+        Python keyword names.
+        """
+        expr = stmt.rvalue
+        if not (isinstance(expr, CallExpr) and _callee_fullname(expr) == SQLMODEL_FIELD_FULLNAME):
+            return []
+
+        alias_arg: str | None = None
+        validation_alias_arg: str | None = None
+        serialization_alias_arg: str | None = None
+        schema_validation_alias: str | None = None
+        schema_serialization_alias: str | None = None
+
+        def _literal_str_or_none(value: Expression) -> str | None:
+            if isinstance(value, StrExpr):
+                return value.value
+            if isinstance(value, NameExpr) and (
+                value.fullname == "builtins.None" or value.name == "None"
+            ):
+                return None
+            return None
+
+        def _is_usable_kwarg_name(name: str) -> bool:
+            return name.isidentifier() and not keyword.iskeyword(name)
+
+        for arg, arg_name in zip(expr.args, expr.arg_names, strict=True):
+            if arg_name == "alias":
+                alias_arg = _literal_str_or_none(arg)
+            elif arg_name == "validation_alias":
+                validation_alias_arg = _literal_str_or_none(arg)
+            elif arg_name == "serialization_alias":
+                serialization_alias_arg = _literal_str_or_none(arg)
+            elif arg_name == "schema_extra" and isinstance(arg, DictExpr):
+                for key_expr, value_expr in arg.items:
+                    if not isinstance(key_expr, StrExpr):
+                        continue
+                    if key_expr.value == "validation_alias":
+                        schema_validation_alias = _literal_str_or_none(value_expr)
+                    elif key_expr.value == "serialization_alias":
+                        schema_serialization_alias = _literal_str_or_none(value_expr)
+
+        validation_alias_final = validation_alias_arg or schema_validation_alias or alias_arg
+        _serialization_alias_final = (
+            serialization_alias_arg or schema_serialization_alias or alias_arg
+        )
+
+        aliases: list[str] = []
+        for candidate in (alias_arg, validation_alias_final):
+            if candidate is None:
+                continue
+            if not _is_usable_kwarg_name(candidate):
+                continue
+            if candidate in aliases:
+                continue
+            aliases.append(candidate)
+        return aliases
+
     def add_initializer(
         self, fields: list[SQLModelField], relationships: list[SQLModelRelationship]
     ) -> None:
@@ -455,8 +541,16 @@ class SQLModelTransformer:
             return
 
         typed = self.plugin_config.init_typed
+        table_model = _is_table_model(info)
+
+        canonical_names = {field.name for field in fields}
+        if table_model:
+            canonical_names.update(rel.name for rel in relationships)
+        if not self.plugin_config.init_forbid_extra:
+            canonical_names.add("kwargs")
 
         args: list[Argument] = []
+        field_params: list[tuple[SQLModelField, Type, list[str]]] = []
         for field in fields:
             expanded = field.expand_type(info, self._api, force_typevars_invariant=True)
             if expanded is not None:
@@ -467,17 +561,23 @@ class SQLModelTransformer:
             else:
                 type_annotation = AnyType(TypeOfAny.explicit)
 
+            field_aliases = [
+                alias
+                for alias in field.aliases
+                if alias != field.name and alias not in canonical_names
+            ]
             variable = Var(field.name, type_annotation)
             args.append(
                 Argument(
                     variable=variable,
                     type_annotation=type_annotation,
                     initializer=None,
-                    kind=ARG_NAMED_OPT if field.has_default else ARG_NAMED,
+                    kind=ARG_NAMED_OPT if field.has_default or field_aliases else ARG_NAMED,
                 )
             )
+            field_params.append((field, type_annotation, field_aliases))
 
-        if _is_table_model(info):
+        if table_model:
             for rel in relationships:
                 expanded = rel.expand_type(info, self._api, force_typevars_invariant=True)
                 if expanded is not None:
@@ -488,6 +588,22 @@ class SQLModelTransformer:
                 else:
                     type_annotation = AnyType(TypeOfAny.explicit)
                 variable = Var(rel.name, type_annotation)
+                args.append(
+                    Argument(
+                        variable=variable,
+                        type_annotation=type_annotation,
+                        initializer=None,
+                        kind=ARG_NAMED_OPT,
+                    )
+                )
+
+        used_names = set(canonical_names)
+        for _field, type_annotation, field_aliases in field_params:
+            for alias in field_aliases:
+                if alias in used_names:
+                    continue
+                used_names.add(alias)
+                variable = Var(alias, type_annotation)
                 args.append(
                     Argument(
                         variable=variable,
@@ -518,7 +634,17 @@ class SQLModelTransformer:
             Var("_fields_set", optional_set_str), optional_set_str, None, ARG_OPT
         )
 
+        table_model = _is_table_model(info)
+
+        canonical_names = {field.name for field in fields}
+        if table_model:
+            canonical_names.update(rel.name for rel in relationships)
+        canonical_names.add("_fields_set")
+        if not self.plugin_config.init_forbid_extra:
+            canonical_names.add("kwargs")
+
         args: list[Argument] = []
+        field_params: list[tuple[SQLModelField, Type, list[str]]] = []
         for field in fields:
             expanded = field.expand_type(info, self._api, force_typevars_invariant=True)
             # `model_construct` bypasses validation, so this is always typed.
@@ -527,17 +653,23 @@ class SQLModelTransformer:
                 expanded = _unwrap_mapped_type(expanded)
             type_annotation = expanded or AnyType(TypeOfAny.explicit)
 
+            field_aliases = [
+                alias
+                for alias in field.aliases
+                if alias != field.name and alias not in canonical_names
+            ]
             variable = Var(field.name, type_annotation)
             args.append(
                 Argument(
                     variable=variable,
                     type_annotation=type_annotation,
                     initializer=None,
-                    kind=ARG_NAMED_OPT if field.has_default else ARG_NAMED,
+                    kind=ARG_NAMED_OPT if field.has_default or field_aliases else ARG_NAMED,
                 )
             )
+            field_params.append((field, type_annotation, field_aliases))
 
-        if _is_table_model(info):
+        if table_model:
             for rel in relationships:
                 expanded = rel.expand_type(info, self._api, force_typevars_invariant=True)
                 if expanded is not None:
@@ -545,6 +677,22 @@ class SQLModelTransformer:
                     expanded = _unwrap_mapped_type(expanded)
                 type_annotation = expanded or AnyType(TypeOfAny.explicit)
                 variable = Var(rel.name, type_annotation)
+                args.append(
+                    Argument(
+                        variable=variable,
+                        type_annotation=type_annotation,
+                        initializer=None,
+                        kind=ARG_NAMED_OPT,
+                    )
+                )
+
+        used_names = set(canonical_names)
+        for _field, type_annotation, field_aliases in field_params:
+            for alias in field_aliases:
+                if alias in used_names:
+                    continue
+                used_names.add(alias)
+                variable = Var(alias, type_annotation)
                 args.append(
                     Argument(
                         variable=variable,

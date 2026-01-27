@@ -14,11 +14,13 @@ from mypy.nodes import (
     CallExpr,
     ClassDef,
     Decorator,
+    DictExpr,
     EllipsisExpr,
     FuncDef,
     IfStmt,
     NameExpr,
     PlaceholderNode,
+    StrExpr,
     SymbolTable,
     SymbolTableNode,
     TempNode,
@@ -192,6 +194,145 @@ def test_get_has_default_covers_common_cases() -> None:
     stmt = AssignmentStmt([NameExpr("x")], EllipsisExpr())
     stmt.new_syntax = True
     assert transformer.get_has_default(stmt) is False
+
+    # x: int = 1 -> optional
+    stmt = AssignmentStmt([NameExpr("x")], NameExpr("y"))
+    stmt.new_syntax = True
+    assert transformer.get_has_default(stmt) is True
+
+
+def test_get_field_aliases_covers_common_cases() -> None:
+    # alias=...
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("full_name")],
+            arg_names=["alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == ["full_name"]
+
+    # alias + validation_alias override
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("a"), StrExpr("va")],
+            arg_names=["alias", "validation_alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == ["a", "va"]
+
+    # schema_extra validation alias
+    schema_extra = DictExpr([(StrExpr("validation_alias"), StrExpr("sa"))])
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("a"), schema_extra],
+            arg_names=["alias", "schema_extra"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == ["a", "sa"]
+
+    # Ignore invalid keyword names.
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("full-name")],
+            arg_names=["alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # Ignore non-literal values.
+    dyn = NameExpr("ALIAS")
+    dyn.fullname = "m.ALIAS"
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[dyn],
+            arg_names=["alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # Non-Field calls -> no aliases.
+    stmt = AssignmentStmt([NameExpr("x")], NameExpr("y"))
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # Explicit alias=None -> treated as absent.
+    none_expr = NameExpr("None")
+    none_expr.fullname = "builtins.None"
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[none_expr],
+            arg_names=["alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # serialization_alias is parsed (but is not a constructor kwarg).
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("ser")],
+            arg_names=["serialization_alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # schema_extra serialization alias is also parsed (but is not a constructor kwarg).
+    schema_extra = DictExpr([(StrExpr("serialization_alias"), StrExpr("ser"))])
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[schema_extra],
+            arg_names=["schema_extra"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # Ignore schema_extra keys that are not string literals.
+    schema_extra = DictExpr([(NameExpr("validation_alias"), StrExpr("sa"))])
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[schema_extra],
+            arg_names=["schema_extra"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # Ignore Python keywords as argument names.
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("class")],
+            arg_names=["alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
 
 
 def test_collect_member_from_stmt_untyped_warns() -> None:
@@ -372,6 +513,51 @@ def test_transform_generates_init_and_model_construct_and_metadata() -> None:
     assert METADATA_KEY in cls.info.metadata
     assert set(cls.info.metadata[METADATA_KEY]["fields"].keys()) == {"a", "b"}
     assert cls.info.metadata[METADATA_KEY]["relationships"] == {}
+
+
+def test_transform_adds_field_alias_kwargs_to_signatures_and_metadata() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+    plugin_config = SimpleNamespace(
+        init_typed=True, init_forbid_extra=True, warn_untyped_fields=True
+    )
+    transformer = SQLModelTransformer(cls, cls, api, plugin_config)
+
+    any_t = AnyType(TypeOfAny.explicit)
+    fields = [
+        SQLModelField(
+            name="name",
+            has_default=False,
+            line=1,
+            column=0,
+            aliases=["full_name"],
+            type=any_t,
+            info=cls.info,
+        )
+    ]
+    transformer.collect_members = lambda: (fields, {})  # type: ignore[method-assign]
+    assert transformer.transform() is True
+
+    init_node = cls.info.names["__init__"].node
+    assert isinstance(init_node, FuncDef)
+    init_args = {a.variable.name: a for a in init_node.arguments}
+    assert "name" in init_args
+    assert "full_name" in init_args
+    assert init_args["name"].kind == ARG_NAMED_OPT
+    assert init_args["full_name"].kind == ARG_NAMED_OPT
+
+    mc_node = cls.info.names["model_construct"].node
+    assert isinstance(mc_node, Decorator)
+    assert isinstance(mc_node.func, FuncDef)
+    mc_args = {a.variable.name: a for a in mc_node.func.arguments}
+    assert "_fields_set" in mc_args
+    assert "name" in mc_args
+    assert "full_name" in mc_args
+    assert mc_args["name"].kind == ARG_NAMED_OPT
+    assert mc_args["full_name"].kind == ARG_NAMED_OPT
+
+    meta = cls.info.metadata[METADATA_KEY]
+    assert meta["fields"]["name"]["aliases"] == ["full_name"]
 
 
 def test_transform_table_model_includes_relationship_kwargs_and_types() -> None:
@@ -601,6 +787,62 @@ def test_field_expand_type_self_type_branch_and_invariant_translation() -> None:
     tv2 = tv.accept(ForceInvariantTypeVars())
     assert isinstance(tv2, TypeVarType)
     assert tv2.variance == INVARIANT
+
+    # Invariant vars are returned unchanged.
+    tv_inv = TypeVarType(
+        "TInv",
+        "TInv",
+        TypeVarId(3),
+        [],
+        AnyType(TypeOfAny.explicit),
+        AnyType(TypeOfAny.explicit),
+        INVARIANT,
+    )
+    tv_inv2 = tv_inv.accept(ForceInvariantTypeVars())
+    assert tv_inv2 is tv_inv
+
+
+def test_field_expand_type_returns_none_when_missing_type() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+
+    field = SQLModelField(
+        name="x",
+        has_default=False,
+        line=1,
+        column=0,
+        type=None,
+        info=cls.info,
+    )
+    assert field.expand_type(cls.info, api) is None
+    field.expand_typevar_from_subtype(cls.info, api)
+
+
+def test_sqlmodelfield_deserialize_dedupes_aliases() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+
+    any_t = AnyType(TypeOfAny.explicit)
+    field = SQLModelField(
+        name="x",
+        has_default=False,
+        line=1,
+        column=0,
+        aliases=["a"],
+        type=any_t,
+        info=cls.info,
+    )
+    data = field.serialize()
+    data["aliases"] = ["a", "a", 1]  # type: ignore[assignment]
+
+    # `deserialize_and_fixup_type()` expects a real mypy `SemanticAnalyzerPluginInterface`
+    # instance; patch it for this unit test so we can exercise the alias handling.
+    from unittest.mock import patch
+
+    with patch("sqlmodel_mypy.transform.deserialize_and_fixup_type", return_value=any_t):
+        field2 = SQLModelField.deserialize(cls.info, data, api)  # type: ignore[arg-type]
+    assert field2.aliases == ["a"]
+    assert isinstance(field2.type, AnyType)
 
 
 def test_collect_fields_includes_if_blocks_and_inherited_metadata() -> None:

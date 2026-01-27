@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlmodel import Field, SQLModel, and_, select
 
 
-class User(SQLModel):
+class User(SQLModel, table=True):
     id: int = Field(primary_key=True)
     name: str = Field()
 
