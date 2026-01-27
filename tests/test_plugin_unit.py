@@ -849,9 +849,18 @@ def test_get_base_class_hook_returns_none_for_non_sqlmodel() -> None:
     assert p.get_base_class_hook("m.Other") is None
 
 
-def test_get_method_signature_hook_selects_only_model_construct() -> None:
+def test_get_method_signature_hook_selects_model_construct_and_exec() -> None:
     p = plugin_mod.SQLModelMypyPlugin(Options())
     assert p.get_method_signature_hook("m.User.other") is None
+
+    hook_exec = p.get_method_signature_hook(plugin_mod.SQLMODEL_SESSION_EXEC_FULLNAME)
+    assert hook_exec is not None
+    assert callable(hook_exec)
+
+    hook_async_exec = p.get_method_signature_hook(plugin_mod.SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME)
+    assert hook_async_exec is not None
+    assert callable(hook_async_exec)
+
     hook = p.get_method_signature_hook("m.User.model_construct")
     assert hook is not None
     assert getattr(hook, "__self__", None) is p

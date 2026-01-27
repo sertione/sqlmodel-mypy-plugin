@@ -73,7 +73,7 @@ errors for documented patterns.
     - Source: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py` (`Field()` implementation).
   - Document what is supported vs intentionally out of scope when users rely on aliases in constructor kwargs.
 
-## v0.6 (Session.exec / AsyncSession.exec typing gaps)
+## v0.6 (Session.exec / AsyncSession.exec typing gaps) - DONE
 
 - **Broaden `Session.exec()` / `AsyncSession.exec()` accepted statement types**
   - Fix common mypy failures when passing non-`Select` statements (e.g. `delete(...)`) to `exec()`.

@@ -42,6 +42,7 @@ from mypy.types import (
     FunctionLike,
     Instance,
     NoneType,
+    Overloaded,
     TupleType,
     Type,
     TypeOfAny,
@@ -79,8 +80,11 @@ SQLALCHEMY_SELECT_JOIN_FROM_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.join_from"
 SQLALCHEMY_SELECT_OUTERJOIN_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.outerjoin"
 SQLALCHEMY_SELECT_OUTERJOIN_FROM_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.outerjoin_from"
 
+SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
+SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
+
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 6
+__version__ = 7
 
 
 class _CollectedField(NamedTuple):
@@ -220,6 +224,10 @@ class SQLModelMypyPlugin(Plugin):
     def get_method_signature_hook(
         self, fullname: str
     ) -> Callable[[MethodSigContext], FunctionLike] | None:
+        if fullname == SQLMODEL_SESSION_EXEC_FULLNAME:
+            return lambda ctx: self._sqlmodel_session_exec_signature_callback(ctx, is_async=False)
+        if fullname == SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME:
+            return lambda ctx: self._sqlmodel_session_exec_signature_callback(ctx, is_async=True)
         if fullname.endswith(".model_construct"):
             return self._sqlmodel_model_construct_signature_callback
         return None
@@ -578,6 +586,86 @@ class SQLModelMypyPlugin(Plugin):
         ret_type: Type = receiver_instance or fill_typevars(receiver_info)
         fallback = ctx.default_signature.fallback
         return CallableType(arg_types, arg_kinds, arg_names, ret_type, fallback)
+
+    def _sqlmodel_session_exec_signature_callback(
+        self, ctx: MethodSigContext, *, is_async: bool
+    ) -> FunctionLike:
+        """Broaden `Session.exec()` accepted statement types.
+
+        SQLModel's stubs accept `sqlmodel.sql.base.Executable[...]`, but many common SQLAlchemy statements
+        (e.g. `text(...)`) are only `sqlalchemy.sql.base.Executable`, causing mypy failures.
+        """
+
+        default = ctx.default_signature
+        items: list[CallableType]
+        if isinstance(default, Overloaded):
+            items = list(default.items)
+        elif isinstance(default, CallableType):
+            items = [default]
+        else:
+            return default
+
+        if not items:
+            return default
+
+        executable_info = _lookup_typeinfo(self, "sqlalchemy.sql.base.Executable")
+        if executable_info is None:
+            return default
+        sqlalchemy_executable = Instance(executable_info, [])
+
+        def _contains_sqlalchemy_executable(tp: Type) -> bool:
+            proper = get_proper_type(tp)
+            if isinstance(proper, Instance):
+                return proper.type.fullname == executable_info.fullname
+            if isinstance(proper, UnionType):
+                return any(_contains_sqlalchemy_executable(item) for item in proper.items)
+            return False
+
+        # Idempotency: if upstream stubs already accept SQLAlchemy Executable, keep them unchanged.
+        for it in items:
+            if it.arg_types and _contains_sqlalchemy_executable(it.arg_types[0]):
+                return default
+
+        any_t = AnyType(TypeOfAny.explicit)
+        try:
+            result_any: Type = ctx.api.named_generic_type(
+                "sqlalchemy.engine.result.Result", [any_t]
+            )
+        except Exception:
+            result_any = any_t
+
+        def _wrap_async_return(ret_template: Type, awaited: Type) -> Type:
+            proper = get_proper_type(ret_template)
+            if isinstance(proper, Instance):
+                fullname = proper.type.fullname
+                if (
+                    fullname in {"typing.Coroutine", "collections.abc.Coroutine"}
+                    and len(proper.args) == 3
+                ):
+                    return Instance(proper.type, [proper.args[0], proper.args[1], awaited])
+                if (
+                    fullname in {"typing.Awaitable", "collections.abc.Awaitable"}
+                    and len(proper.args) == 1
+                ):
+                    return Instance(proper.type, [awaited])
+            try:
+                return ctx.api.named_generic_type("typing.Coroutine", [any_t, any_t, awaited])
+            except Exception:
+                return any_t
+
+        template = items[-1]
+        if not template.arg_types:
+            return default
+
+        new_arg_types = list(template.arg_types)
+        new_arg_types[0] = sqlalchemy_executable
+
+        new_ret: Type = result_any
+        if is_async:
+            new_ret = _wrap_async_return(template.ret_type, result_any)
+
+        new_items = items + [template.copy_modified(arg_types=new_arg_types, ret_type=new_ret)]
+        return Overloaded(new_items) if len(new_items) > 1 else new_items[0]
 
     def _sqlalchemy_select_join_return_type_callback(self, ctx: MethodContext) -> Type:
         # join(target, onclause=None, *, isouter: bool = False, full: bool = False)

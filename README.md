@@ -15,6 +15,8 @@ Planned work is tracked in [`ROADMAP.md`](ROADMAP.md).
 - Improve SQLAlchemy expression typing for **class** attribute access on `table=True` models (e.g. `User.id`,
   `User.name`, `Team.heroes`).
 - Outer-join `None` propagation in `select(A, B).join(B, isouter=True)` result tuples.
+- Broaden `Session.exec()` / `AsyncSession.exec()` typing to accept SQLAlchemy `Executable` statements (e.g.
+  `text(...)`), not just `select(...)`.
 - Compatible with `pydantic.mypy` in either plugin order.
 
 ## Install (dev)
