@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqlmodel-mypy"
+version = "0.1.0"
+description = "Mypy plugin for SQLModel (better constructor/Field typing)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Artem" }]
+keywords = ["mypy", "plugin", "sqlmodel", "pydantic", "sqlalchemy", "typing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Typing :: Typed",
+]
+dependencies = [
+  # This plugin uses mypy's internal APIs and is loaded by mypy.
+  "mypy>=1.19.1",
+  "typing-extensions>=4.10.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-cov>=5",
+  "ruff>=0.6",
+  "sqlmodel>=0.0.31",
+]
+
+[project.urls]
+Repository = "https://example.invalid/sqlmodel-mypy"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlmodel_mypy"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/README.md",
+  "/ROADMAP.md",
+  "/AGENTS.md",
+  "/LICENSE",
+  "/pyproject.toml",
+  "/.pre-commit-config.yaml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  "E",  # pycodestyle errors
+  "W",  # pycodestyle warnings
+  "F",  # pyflakes
+  "I",  # isort
+  "B",  # flake8-bugbear
+  "UP", # pyupgrade
+]
+ignore = [
+  "E501", # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.isort]
+known-third-party = ["mypy", "sqlmodel", "pydantic", "sqlalchemy"]
+
+[tool.mypy]
+strict = true
+mypy_path = ["src"]
+packages = ["sqlmodel_mypy"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

@@ -1,0 +1,32 @@
+from __future__ import annotations
+
+from sqlmodel import Field, Relationship, SQLModel
+
+
+class Team(SQLModel):
+    id: int | None = Field(default=None, primary_key=True)
+    name: str
+
+    heroes: list[Hero] = Relationship(back_populates="team")
+
+
+class Hero(SQLModel):
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(index=True)
+    secret_name: str = Field()
+    age: int = 0
+    team_id: int | None = Field(default=None, foreign_key="team.id")
+
+    team: Team | None = Relationship(back_populates="heroes")
+
+
+Team()
+Team(name="Avengers")
+
+Hero()
+Hero(name="Spiderman")
+Hero(name="Spiderman", secret_name="Peter")
+Hero(name="Spiderman", secret_name="Peter", extra=1)
+
+# Type errors only when init_typed=true
+Hero(name=1, secret_name=2)
