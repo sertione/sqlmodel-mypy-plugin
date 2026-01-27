@@ -14,7 +14,7 @@
   - `init_forbid_extra`
 - Better handling of inherited fields (including generics/typevars) and overrides.
 
-## v0.3+
+## v0.3 - DONE
 
 - Relationship typing improvements (forward refs, `Mapped[...]` wrapping behavior).
 - Typed SQL expression building (reduce need for `col()`, `table.c.*`, etc.):
@@ -22,4 +22,9 @@
   - Ensure common SQLModel re-exports (`select`, `and_`, `or_`, `col`, etc.) preserve SQLAlchemy typing.
   - Decide approach: plugin hooks vs stub overlays vs relying on SQLAlchemy typing (documented trade-offs).
 - Compatibility matrix CI across mypy/SQLModel versions (and pin policy).
-- Maybe find a way to not force user put plugins in their configs in right way (for example sqlmodel before or after pydantic for correct resolution)
+- Avoid forcing users to order plugins (`sqlmodel_mypy.plugin` vs `pydantic.mypy`) for correct SQLModel resolution.
+
+## v0.4+
+
+- More SQL expression typing coverage (joins, relationship comparators, etc.).
+- Revisit trade-offs: plugin hooks vs stubs/overlays (document).

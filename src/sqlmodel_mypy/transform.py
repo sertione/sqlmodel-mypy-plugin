@@ -3,6 +3,7 @@
 This module is intentionally small and focused:
 - collect SQLModel fields (treating `sqlmodel.Field(...)` correctly for requiredness)
 - ignore `sqlmodel.Relationship(...)` for constructor generation
+- record relationship member names for later typing hooks
 - synthesize `__init__` on SQLModel subclasses
 """
 
@@ -77,6 +78,8 @@ METADATA_KEY = "sqlmodel-mypy-metadata"
 SQLMODEL_BASEMODEL_FULLNAME = "sqlmodel.main.SQLModel"
 SQLMODEL_FIELD_FULLNAME = "sqlmodel.main.Field"
 SQLMODEL_RELATIONSHIP_FULLNAME = "sqlmodel.main.Relationship"
+
+SQLALCHEMY_MAPPED_FULLNAMES = {"sqlalchemy.orm.Mapped", "sqlalchemy.orm.base.Mapped"}
 
 ERROR_FIELD = ErrorCode("sqlmodel-field", "SQLModel field error", "SQLModel")
 
@@ -168,6 +171,19 @@ class SQLModelField:
             self.type = map_type_from_supertype(self.type, sub_type, self.info)
 
 
+class SQLModelRelationship:
+    """A collected SQLModel relationship (excluded from constructor signatures).
+
+    We store relationship member names in metadata so later hooks can adjust class attribute typing
+    (e.g. `Hero.team` in SQLAlchemy expressions).
+    """
+
+    def __init__(self, *, name: str, line: int, column: int) -> None:
+        self.name = name
+        self.line = line
+        self.column = column
+
+
 class SQLModelTransformer:
     def __init__(
         self,
@@ -184,10 +200,11 @@ class SQLModelTransformer:
     def transform(self) -> bool:
         info = self._cls.info
 
-        fields = self.collect_fields()
-        if fields is None:
+        members = self.collect_members()
+        if members is None:
             self._api.defer()
             return False
+        fields, relationships = members
 
         for f in fields:
             if f.type is None:
@@ -199,14 +216,16 @@ class SQLModelTransformer:
 
         info.metadata[METADATA_KEY] = {
             "fields": {field.name: field.serialize() for field in fields},
+            "relationships": sorted(relationships),
         }
         return True
 
-    def collect_fields(self) -> list[SQLModelField] | None:
+    def collect_members(self) -> tuple[list[SQLModelField], set[str]] | None:
         cls = self._cls
         info = cls.info
 
         found_fields: dict[str, SQLModelField] = {}
+        found_relationships: set[str] = set()
 
         # 1) Inherited fields (base first).
         for base_info in reversed(info.mro[1:-1]):  # exclude current class and object
@@ -219,7 +238,8 @@ class SQLModelTransformer:
                 continue
 
             self._api.add_plugin_dependency(make_wildcard_trigger(base_info.fullname))
-            for name, data in base_info.metadata[METADATA_KEY]["fields"].items():
+            base_metadata = base_info.metadata[METADATA_KEY]
+            for name, data in base_metadata.get("fields", {}).items():
                 sym_node = info.names.get(name)
                 if sym_node and sym_node.node and not isinstance(sym_node.node, Var):
                     self._api.fail(
@@ -231,14 +251,23 @@ class SQLModelTransformer:
                 base_field.expand_typevar_from_subtype(info, self._api)
                 found_fields[name] = base_field
 
+            for name in base_metadata.get("relationships", []):
+                if isinstance(name, str):
+                    found_relationships.add(name)
+
         # 2) Current class fields.
         for stmt in self._get_assignment_statements_from_block(cls.defs):
-            current_field = self.collect_field_from_stmt(stmt)
-            if current_field is None:
+            member = self.collect_member_from_stmt(stmt)
+            if member is None:
                 continue
-            found_fields[current_field.name] = current_field
+            if isinstance(member, SQLModelField):
+                found_relationships.discard(member.name)
+                found_fields[member.name] = member
+            else:
+                found_fields.pop(member.name, None)
+                found_relationships.add(member.name)
 
-        return list(found_fields.values())
+        return list(found_fields.values()), found_relationships
 
     def _get_assignment_statements_from_if_statement(
         self, stmt: IfStmt
@@ -256,7 +285,9 @@ class SQLModelTransformer:
             elif isinstance(stmt, IfStmt):
                 yield from self._get_assignment_statements_from_if_statement(stmt)
 
-    def collect_field_from_stmt(self, stmt: AssignmentStmt) -> SQLModelField | None:
+    def collect_member_from_stmt(
+        self, stmt: AssignmentStmt
+    ) -> SQLModelField | SQLModelRelationship | None:
         # Untyped assignment (e.g. `x = Field(...)`).
         if not stmt.new_syntax:
             lhs = stmt.lvalues[0]
@@ -278,12 +309,12 @@ class SQLModelTransformer:
         if name == "model_config" or name.startswith("_"):
             return None
 
-        # Skip relationships: `foo: list[Bar] = Relationship(...)`
+        # Relationship: `foo: list[Bar] = Relationship(...)`
         if (
             isinstance(stmt.rvalue, CallExpr)
             and _callee_fullname(stmt.rvalue) == SQLMODEL_RELATIONSHIP_FULLNAME
         ):
-            return None
+            return SQLModelRelationship(name=name, line=stmt.line, column=stmt.column)
 
         sym = self._cls.info.names.get(name)
         if sym is None or sym.node is None:
@@ -345,6 +376,7 @@ class SQLModelTransformer:
             expanded = field.expand_type(info, self._api, force_typevars_invariant=True)
             if expanded is not None:
                 expanded = expanded.accept(ForceInvariantTypeVars())
+                expanded = _unwrap_mapped_type(expanded)
             if typed and expanded is not None:
                 type_annotation = expanded
             else:
@@ -385,6 +417,7 @@ class SQLModelTransformer:
             # `model_construct` bypasses validation, so this is always typed.
             if expanded is not None:
                 expanded = expanded.accept(ForceInvariantTypeVars())
+                expanded = _unwrap_mapped_type(expanded)
             type_annotation = expanded or AnyType(TypeOfAny.explicit)
 
             variable = Var(field.name, type_annotation)
@@ -417,6 +450,20 @@ def _callee_fullname(call: CallExpr) -> str | None:
     if isinstance(callee, RefExpr):
         return callee.fullname
     return None
+
+
+def _unwrap_mapped_type(typ: Type) -> Type:
+    """Convert SQLAlchemy `Mapped[T]` annotations to `T` for constructor signatures.
+
+    SQLModel model attributes can be annotated as `Mapped[T]` for ORM mapping, but users pass plain `T`
+    values into `__init__`/`model_construct` (not `Mapped[T]` descriptors).
+    """
+    proper = get_proper_type(typ)
+    if isinstance(proper, Instance) and proper.type.fullname in SQLALCHEMY_MAPPED_FULLNAMES:
+        if proper.args:
+            return proper.args[0]
+        return AnyType(TypeOfAny.from_omitted_generics)
+    return typ
 
 
 def add_method(

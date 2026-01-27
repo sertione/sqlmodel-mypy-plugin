@@ -13,7 +13,6 @@ class Hero(SQLModel):
     team: Team | None = Relationship(back_populates="heroes")
 
 
-Hero(team=None)
-# MYPY: error: Unexpected keyword argument "team"  [call-arg]
-Hero(name="x", team=None)
-# MYPY: error: Unexpected keyword argument "team"  [call-arg]
+# Relationship class attributes should be SQLAlchemy instrumented attributes, not plain values.
+bad_heroes: list[Hero] = Team.heroes
+bad_team: Team | None = Hero.team

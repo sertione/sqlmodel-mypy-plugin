@@ -4,12 +4,15 @@ Mypy plugin that improves type checking for [`SQLModel`](https://github.com/fast
 
 ## Status
 
-Early/experimental. The first milestone is **correct required/optional kwargs** for fields declared via
-`sqlmodel.Field(...)` and **ignoring** `sqlmodel.Relationship(...)` in generated constructor signatures.
+Early/experimental. Current scope:
+
+- Generate correct `__init__` / `model_construct` signatures for SQLModel models (treat `sqlmodel.Field(...)`
+  required/optional correctly; ignore `sqlmodel.Relationship(...)` in constructors).
+- Improve SQLAlchemy expression typing for **class** attribute access (e.g. `User.id`, `User.name`).
 
 ## Install (dev)
 
-Prereqs: **Python \u2265 3.10** and [`uv`](https://docs.astral.sh/uv/).
+Prereqs: **Python 3.10+** and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
 make install
@@ -30,11 +33,13 @@ make check
 plugins = sqlmodel_mypy.plugin
 ```
 
-If you also use `pydantic.mypy`, list this plugin **first** so it can take over SQLModel classes:
+If you also use `pydantic.mypy`, you can list plugins in either order:
 
 ```ini
 [mypy]
 plugins = sqlmodel_mypy.plugin, pydantic.mypy
+# or:
+# plugins = pydantic.mypy, sqlmodel_mypy.plugin
 ```
 
 ## Plugin configuration
@@ -60,6 +65,21 @@ warn_untyped_fields = true
 ## Error codes
 
 - `sqlmodel-field`: field-related plugin errors (e.g. untyped `x = Field(...)`).
+
+## SQL expression typing
+
+This plugin adjusts **class attribute** types on SQLModel models to behave like SQLAlchemy expressions, so you can
+write queries without `col()`:
+
+```py
+from sqlmodel import Field, SQLModel, select
+
+class User(SQLModel):
+    id: int = Field(primary_key=True)
+    name: str = Field()
+
+stmt = select(User).where(User.name.like("%x%"))
+```
 
 ## Development
 
