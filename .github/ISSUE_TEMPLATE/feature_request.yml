@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest an improvement or a new typing feature
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What problem are you trying to solve? What is hard/unsafe today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to see implemented? Include examples if possible.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives / workarounds
+      description: Any existing workarounds or alternative approaches you've considered.
+    validations:
+      required: false
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions (optional)
+      description: Python / mypy / sqlmodel versions you care about.
+      placeholder: "Python 3.12, mypy 1.19, sqlmodel 0.0.31"
+    validations:
+      required: false

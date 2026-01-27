@@ -1,13 +1,13 @@
 # Roadmap
 
-## v0.1 (MVP)
+## v0.1 (MVP) - DONE
 
 - Correct required/optional kwargs for `sqlmodel.Field(...)` when generating `__init__`.
 - Exclude `sqlmodel.Relationship(...)` from generated `__init__` kwargs.
 - Minimal plugin config + cache invalidation via `report_config_data()`.
 - Mypy integration test suite with golden outputs.
 
-## v0.2
+## v0.2 - DONE
 
 - Config parity with Pydantic plugin (more knobs; documented):
   - `init_typed`
@@ -22,3 +22,4 @@
   - Ensure common SQLModel re-exports (`select`, `and_`, `or_`, `col`, etc.) preserve SQLAlchemy typing.
   - Decide approach: plugin hooks vs stub overlays vs relying on SQLAlchemy typing (documented trade-offs).
 - Compatibility matrix CI across mypy/SQLModel versions (and pin policy).
+- Maybe find a way to not force user put plugins in their configs in right way (for example sqlmodel before or after pydantic for correct resolution)

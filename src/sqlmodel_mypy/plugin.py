@@ -120,7 +120,7 @@ def parse_toml(config_file: str) -> dict[str, Any] | None:
         import tomllib as toml_
     else:
         try:
-            import tomli as toml_  # type: ignore[no-redef]
+            import tomli as toml_
         except ImportError:  # pragma: no cover
             return None
 
