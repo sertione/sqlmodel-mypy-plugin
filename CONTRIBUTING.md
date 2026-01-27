@@ -1,19 +1,18 @@
 # Contributing
 
-## Dev setup (uv)
+## Dev setup
 
 ```bash
-uv sync --locked --group dev
+make install
 ```
 
 ## Checks
 
 ```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy
-uv run pytest
+make check
 ```
+
+`make check` includes a **coverage gate**: package coverage must stay **90%+**.
 
 ## Mypy plugin integration tests
 
@@ -31,7 +30,7 @@ We test plugin behavior by running mypy against small modules and committing the
 3. Regenerate outputs:
 
 ```bash
-uv run pytest --update-mypy
+make update-mypy
 ```
 
 4. Ensure the new output contains the expected `# MYPY:` lines (or no output file is created if there are no mypy errors).
@@ -48,3 +47,23 @@ This value is included in `report_config_data()` and forces mypy to invalidate i
 
 - This project uses mypy internal APIs and must be pinned/tested against specific mypy versions.
 - `uv.lock` is the source of truth for CI/dev reproducibility.
+
+## Release (PyPI)
+
+This project uses **GitHub Actions** + **PyPI trusted publishing**.
+
+1. Bump the version in `pyproject.toml`.
+2. Ensure `make check` is green on `main`.
+3. Tag and push:
+
+```bash
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push --tags
+```
+
+4. The `publish` workflow builds and publishes to PyPI.
+
+Maintainers must configure:
+
+- GitHub environment `pypi`
+- A trusted publisher on PyPI pointing at this repository/workflow

@@ -85,7 +85,11 @@ class ForceInvariantTypeVars(TypeTranslator):
     def visit_type_var(self, t: TypeVarType) -> Type:  # noqa: D102
         if t.variance == INVARIANT:
             return t
-        return t.copy_modified(variance=INVARIANT)
+        # `TypeVarType.copy_modified(variance=...)` does not reliably update the variance across mypy
+        # versions, so mutate explicitly.
+        modified = t.copy_modified()
+        modified.variance = INVARIANT
+        return modified
 
     def visit_type_alias_type(self, t: TypeAliasType) -> Type:  # noqa: D102
         # Expand type aliases and then continue translation.

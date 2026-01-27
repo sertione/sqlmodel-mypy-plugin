@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a bug or a wrong type-checking result
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please include a minimal reproducible example — mypy plugins are very sensitive to context.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the incorrect behavior (error message, wrong signature, etc.).
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: |
+        Provide a minimal SQLModel example and the exact mypy invocation.
+        Prefer a single file if possible.
+      placeholder: |
+        # example.py
+        from sqlmodel import SQLModel, Field
+
+        class User(SQLModel):
+            id: int = Field(primary_key=True)
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: mypy configuration
+      description: Paste the relevant `mypy.ini` / `pyproject.toml` sections.
+      placeholder: |
+        [mypy]
+        plugins = sqlmodel_mypy.plugin
+      render: ini
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: mypy output / traceback
+      description: Paste the full output (include plugin debug output if any).
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Python / mypy / sqlmodel / plugin version (and OS if relevant).
+      placeholder: "Python 3.12.2, mypy 1.19.1, sqlmodel 0.0.31, sqlmodel-mypy 0.1.0"
+    validations:
+      required: true

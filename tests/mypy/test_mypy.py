@@ -11,7 +11,6 @@ try:
 except ImportError:  # pragma: no cover
     mypy_api = None
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUTS_DIR = REPO_ROOT / "tests/mypy/outputs"
 
