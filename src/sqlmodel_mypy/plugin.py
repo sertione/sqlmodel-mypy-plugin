@@ -16,8 +16,10 @@ from mypy.nodes import (
     AssignmentStmt,
     Block,
     CallExpr,
+    Expression,
     IfStmt,
     NameExpr,
+    RefExpr,
     TypeInfo,
     Var,
 )
@@ -27,6 +29,7 @@ from mypy.plugin import (
     ClassDefContext,
     FunctionContext,
     FunctionSigContext,
+    MethodContext,
     MethodSigContext,
     Plugin,
     ReportConfigContext,
@@ -39,6 +42,7 @@ from mypy.types import (
     FunctionLike,
     Instance,
     NoneType,
+    TupleType,
     Type,
     TypeOfAny,
     TypeType,
@@ -69,8 +73,14 @@ SQLALCHEMY_INSTRUMENTED_ATTRIBUTE_FULLNAMES = {
     "sqlalchemy.orm.attributes.InstrumentedAttribute",
 }
 
+SQLALCHEMY_SELECT_FULLNAME = "sqlalchemy.sql.selectable.Select"
+SQLALCHEMY_SELECT_JOIN_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.join"
+SQLALCHEMY_SELECT_JOIN_FROM_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.join_from"
+SQLALCHEMY_SELECT_OUTERJOIN_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.outerjoin"
+SQLALCHEMY_SELECT_OUTERJOIN_FROM_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.outerjoin_from"
+
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 3
+__version__ = 5
 
 
 class _CollectedField(NamedTuple):
@@ -79,6 +89,66 @@ class _CollectedField(NamedTuple):
     line: int
     column: int
     type: Type | None
+
+
+class _CollectedRelationship(NamedTuple):
+    name: str
+    line: int
+    column: int
+    type: Type | None
+
+
+def _is_bool_nameexpr(expr: Expression, value: bool) -> bool:
+    if not isinstance(expr, NameExpr):
+        return False
+    if value:
+        return expr.fullname == "builtins.True" or expr.name == "True"
+    return expr.fullname == "builtins.False" or expr.name == "False"
+
+
+def _is_table_model(info: TypeInfo) -> bool:
+    """Best-effort detection for `class Model(SQLModel, table=True)`."""
+    kw = info.defn.keywords.get("table")
+    if kw is not None:
+        return _is_bool_nameexpr(kw, True)
+
+    # Inherit `table=True` from bases if present.
+    for base in info.mro[1:]:
+        if base.fullname == SQLMODEL_BASEMODEL_FULLNAME:
+            continue
+        kw = base.defn.keywords.get("table")
+        if kw is not None and _is_bool_nameexpr(kw, True):
+            return True
+    return False
+
+
+def _call_get_kwarg(call: CallExpr, name: str) -> Expression | None:
+    for arg_name, arg_expr in zip(call.arg_names, call.args, strict=True):
+        if arg_name == name:
+            return arg_expr
+    return None
+
+
+def _call_get_positional(call: CallExpr, index: int) -> Expression | None:
+    pos = 0
+    for arg_name, arg_expr in zip(call.arg_names, call.args, strict=True):
+        if arg_name is None:
+            if pos == index:
+                return arg_expr
+            pos += 1
+    return None
+
+
+def _call_get_arg(call: CallExpr, name: str, positional_index: int) -> Expression | None:
+    return _call_get_kwarg(call, name) or _call_get_positional(call, positional_index)
+
+
+def _typeinfo_from_ref_expr(expr: Expression | None) -> TypeInfo | None:
+    if expr is None:
+        return None
+    if isinstance(expr, RefExpr) and isinstance(expr.node, TypeInfo):
+        return expr.node
+    return None
 
 
 def plugin(version: str) -> type[Plugin]:
@@ -153,6 +223,17 @@ class SQLModelMypyPlugin(Plugin):
             return self._sqlmodel_model_construct_signature_callback
         return None
 
+    def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
+        if fullname == SQLALCHEMY_SELECT_JOIN_FULLNAME:
+            return self._sqlalchemy_select_join_return_type_callback
+        if fullname == SQLALCHEMY_SELECT_JOIN_FROM_FULLNAME:
+            return self._sqlalchemy_select_join_from_return_type_callback
+        if fullname == SQLALCHEMY_SELECT_OUTERJOIN_FULLNAME:
+            return self._sqlalchemy_select_outerjoin_return_type_callback
+        if fullname == SQLALCHEMY_SELECT_OUTERJOIN_FROM_FULLNAME:
+            return self._sqlalchemy_select_outerjoin_from_return_type_callback
+        return None
+
     def get_class_attribute_hook(self, fullname: str) -> Callable[[AttributeContext], Type] | None:
         """Type SQLModel class attributes as SQLAlchemy expressions (e.g. `User.id`)."""
         if "." not in fullname:
@@ -206,17 +287,23 @@ class SQLModelMypyPlugin(Plugin):
     def _collect_fields_for_signature(
         self, model_info: TypeInfo, api: Any
     ) -> list[_CollectedField]:
-        """Collect SQLModel fields for signature generation (including inherited ones)."""
+        fields, _relationships = self._collect_members_for_signature(model_info, api)
+        return fields
+
+    def _collect_members_for_signature(
+        self, model_info: TypeInfo, api: Any
+    ) -> tuple[list[_CollectedField], list[_CollectedRelationship]]:
+        """Collect SQLModel members for signature generation (including inherited ones)."""
         found_fields: dict[str, _CollectedField] = {}
-        found_relationships: set[str] = set()
+        found_relationships: dict[str, _CollectedRelationship] = {}
 
         def _add_field(field: _CollectedField) -> None:
-            found_relationships.discard(field.name)
+            found_relationships.pop(field.name, None)
             found_fields[field.name] = field
 
-        def _add_relationship(name: str) -> None:
-            found_fields.pop(name, None)
-            found_relationships.add(name)
+        def _add_relationship(rel: _CollectedRelationship) -> None:
+            found_fields.pop(rel.name, None)
+            found_relationships[rel.name] = rel
 
         # 1) Inherited members (base first, mirroring semantic-phase logic).
         for base_info in reversed(model_info.mro[1:-1]):  # exclude current class and object
@@ -262,7 +349,7 @@ class SQLModelMypyPlugin(Plugin):
             else:
                 _add_relationship(member)
 
-        return list(found_fields.values())
+        return list(found_fields.values()), list(found_relationships.values())
 
     def _collect_member_from_stmt(
         self,
@@ -271,7 +358,7 @@ class SQLModelMypyPlugin(Plugin):
         defining_info: TypeInfo,
         current_info: TypeInfo,
         api: Any,
-    ) -> _CollectedField | str | None:
+    ) -> _CollectedField | _CollectedRelationship | None:
         # Untyped assignment (e.g. `x = Field(...)`).
         if not stmt.new_syntax:
             lhs = stmt.lvalues[0]
@@ -298,7 +385,19 @@ class SQLModelMypyPlugin(Plugin):
             isinstance(stmt.rvalue, CallExpr)
             and _callee_fullname(stmt.rvalue) == SQLMODEL_RELATIONSHIP_FULLNAME
         ):
-            return name
+            rel_type: Type | None = None
+            sym = defining_info.names.get(name)
+            if sym is not None and isinstance(sym.node, Var) and not sym.node.is_classvar:
+                rel_type = sym.node.type
+                if rel_type is not None and defining_info is not current_info:
+                    with state.strict_optional_set(api.options.strict_optional):
+                        rel_type = map_type_from_supertype(rel_type, current_info, defining_info)
+            return _CollectedRelationship(
+                name=name,
+                line=stmt.line,
+                column=stmt.column,
+                type=rel_type,
+            )
 
         sym = defining_info.names.get(name)
         if sym is None or sym.node is None:
@@ -325,7 +424,7 @@ class SQLModelMypyPlugin(Plugin):
     def _sqlmodel_constructor_signature_callback(
         self, ctx: FunctionSigContext, info: TypeInfo
     ) -> FunctionLike:
-        fields = self._collect_fields_for_signature(info, ctx.api)
+        fields, relationships = self._collect_members_for_signature(info, ctx.api)
 
         arg_types: list[Type] = []
         arg_names: list[str | None] = []
@@ -342,6 +441,17 @@ class SQLModelMypyPlugin(Plugin):
             arg_types.append(t)
             arg_names.append(f.name)
             arg_kinds.append(ARG_NAMED_OPT if f.has_default else ARG_NAMED)
+
+        if _is_table_model(info):
+            for rel in relationships:
+                if typed and rel.type is not None:
+                    t = rel.type.accept(ForceInvariantTypeVars())
+                    t = _unwrap_mapped_type(t)
+                else:
+                    t = AnyType(TypeOfAny.explicit)
+                arg_types.append(t)
+                arg_names.append(rel.name)
+                arg_kinds.append(ARG_NAMED_OPT)
 
         if not self.plugin_config.init_forbid_extra:
             kw = AnyType(TypeOfAny.explicit)
@@ -375,7 +485,7 @@ class SQLModelMypyPlugin(Plugin):
         if not receiver_info.has_base(SQLMODEL_BASEMODEL_FULLNAME):
             return ctx.default_signature
 
-        fields = self._collect_fields_for_signature(receiver_info, ctx.api)
+        fields, relationships = self._collect_members_for_signature(receiver_info, ctx.api)
 
         set_str = ctx.api.named_generic_type(
             "builtins.set", [ctx.api.named_generic_type("builtins.str", [])]
@@ -397,6 +507,18 @@ class SQLModelMypyPlugin(Plugin):
             arg_names.append(f.name)
             arg_kinds.append(ARG_NAMED_OPT if f.has_default else ARG_NAMED)
 
+        if _is_table_model(receiver_info):
+            for rel in relationships:
+                t = (
+                    rel.type.accept(ForceInvariantTypeVars())
+                    if rel.type is not None
+                    else AnyType(TypeOfAny.explicit)
+                )
+                t = _unwrap_mapped_type(t)
+                arg_types.append(t)
+                arg_names.append(rel.name)
+                arg_kinds.append(ARG_NAMED_OPT)
+
         if not self.plugin_config.init_forbid_extra:
             kw = AnyType(TypeOfAny.explicit)
             arg_types.append(kw)
@@ -406,6 +528,81 @@ class SQLModelMypyPlugin(Plugin):
         ret_type: Type = receiver_instance or fill_typevars(receiver_info)
         fallback = ctx.default_signature.fallback
         return CallableType(arg_types, arg_kinds, arg_names, ret_type, fallback)
+
+    def _sqlalchemy_select_join_return_type_callback(self, ctx: MethodContext) -> Type:
+        # join(target, onclause=None, *, isouter: bool = False, full: bool = False)
+        return self._sqlalchemy_select_join_like_return_type(
+            ctx, target_positional_index=0, isouter_always=False
+        )
+
+    def _sqlalchemy_select_join_from_return_type_callback(self, ctx: MethodContext) -> Type:
+        # join_from(from_, target, onclause=None, *, isouter: bool = False, full: bool = False)
+        return self._sqlalchemy_select_join_like_return_type(
+            ctx, target_positional_index=1, isouter_always=False
+        )
+
+    def _sqlalchemy_select_outerjoin_return_type_callback(self, ctx: MethodContext) -> Type:
+        # outerjoin(target, onclause=None, *, full: bool = False)
+        return self._sqlalchemy_select_join_like_return_type(
+            ctx, target_positional_index=0, isouter_always=True
+        )
+
+    def _sqlalchemy_select_outerjoin_from_return_type_callback(self, ctx: MethodContext) -> Type:
+        # outerjoin_from(from_, target, onclause=None, *, full: bool = False)
+        return self._sqlalchemy_select_join_like_return_type(
+            ctx, target_positional_index=1, isouter_always=True
+        )
+
+    def _sqlalchemy_select_join_like_return_type(
+        self, ctx: MethodContext, *, target_positional_index: int, isouter_always: bool
+    ) -> Type:
+        # Only handle "outer join" for now, and only when it's explicit/literal.
+        call = ctx.context
+        if not isinstance(call, CallExpr):
+            return ctx.default_return_type
+
+        if not isouter_always:
+            isouter_expr = _call_get_kwarg(call, "isouter")
+            if isouter_expr is None:
+                return ctx.default_return_type
+            if not _is_bool_nameexpr(isouter_expr, True):
+                return ctx.default_return_type
+
+        target_expr = _call_get_arg(call, "target", target_positional_index)
+        target_info = _typeinfo_from_ref_expr(target_expr)
+        if target_info is None:
+            return ctx.default_return_type
+
+        receiver = get_proper_type(ctx.type)
+        if not isinstance(receiver, Instance):
+            return ctx.default_return_type
+        if receiver.type.fullname != SQLALCHEMY_SELECT_FULLNAME:
+            return ctx.default_return_type
+        if not receiver.args:
+            return ctx.default_return_type
+
+        tp = get_proper_type(receiver.args[0])
+        if not isinstance(tp, TupleType):
+            return ctx.default_return_type
+
+        changed = False
+        new_items: list[Type] = []
+        for item in tp.items:
+            proper_item = get_proper_type(item)
+            if (
+                isinstance(proper_item, Instance)
+                and proper_item.type.fullname == target_info.fullname
+            ):
+                new_items.append(UnionType.make_union([item, NoneType()]))
+                changed = True
+            else:
+                new_items.append(item)
+
+        if not changed:
+            return ctx.default_return_type
+
+        new_tp = tp.copy_modified(items=new_items)
+        return Instance(receiver.type, [new_tp])
 
     def _sqlmodel_class_attr_type_callback(self, ctx: AttributeContext) -> Type:
         if ctx.is_lvalue:

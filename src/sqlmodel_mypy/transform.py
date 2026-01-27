@@ -2,8 +2,8 @@
 
 This module is intentionally small and focused:
 - collect SQLModel fields (treating `sqlmodel.Field(...)` correctly for requiredness)
-- ignore `sqlmodel.Relationship(...)` for constructor generation
-- record relationship member names for later typing hooks
+- include relationship kwargs for table-model constructors
+- record relationship member names (and types) for later typing hooks
 - synthesize `__init__` on SQLModel subclasses
 """
 
@@ -172,7 +172,7 @@ class SQLModelField:
 
 
 class SQLModelRelationship:
-    """A collected SQLModel relationship (excluded from constructor signatures).
+    """A collected SQLModel relationship.
 
     We store relationship member names in metadata so later hooks can adjust class attribute typing
     (e.g. `Hero.team` in SQLAlchemy expressions).
@@ -182,6 +182,63 @@ class SQLModelRelationship:
         self.name = name
         self.line = line
         self.column = column
+
+        # Optional: available once semantic analysis resolves the annotation.
+        self.type: Type | None = None
+        self.info: TypeInfo | None = None
+
+    def expand_type(
+        self,
+        current_info: TypeInfo,
+        api: SemanticAnalyzerPluginInterface,
+        *,
+        force_typevars_invariant: bool = False,
+    ) -> Type | None:
+        if self.type is None or self.info is None:
+            return None
+
+        typ = self.type
+        if force_typevars_invariant and isinstance(typ, TypeVarType):
+            modified = typ.copy_modified()
+            modified.variance = INVARIANT
+            typ = modified
+
+        # Mirror SQLModelField.expand_type() behavior.
+        if self.info.self_type is not None:
+            with state.strict_optional_set(api.options.strict_optional):
+                filled_with_typevars = fill_typevars(current_info)
+                assert isinstance(filled_with_typevars, Instance)
+                return expand_type(typ, {self.info.self_type.id: filled_with_typevars})
+        return typ
+
+    def serialize(self) -> JsonDict:
+        return {
+            "name": self.name,
+            "line": self.line,
+            "column": self.column,
+            "type": None if self.type is None else self.type.serialize(),
+        }
+
+    @classmethod
+    def deserialize(
+        cls, info: TypeInfo, data: JsonDict, api: SemanticAnalyzerPluginInterface
+    ) -> SQLModelRelationship:
+        data = data.copy()
+        typ_data = data.pop("type", None)
+        name = data.pop("name")
+        rel = cls(name=name, **data)
+        rel.info = info
+        if typ_data is not None:
+            rel.type = deserialize_and_fixup_type(typ_data, api)
+        return rel
+
+    def expand_typevar_from_subtype(
+        self, sub_type: TypeInfo, api: SemanticAnalyzerPluginInterface
+    ) -> None:
+        if self.type is None or self.info is None:
+            return
+        with state.strict_optional_set(api.options.strict_optional):
+            self.type = map_type_from_supertype(self.type, sub_type, self.info)
 
 
 class SQLModelTransformer:
@@ -211,21 +268,25 @@ class SQLModelTransformer:
                 self._api.defer()
                 return False
 
-        self.add_initializer(fields)
-        self.add_model_construct(fields)
+        # Relationship types are nice-to-have but not required to proceed; if unknown,
+        # relationship args fall back to Any in signatures.
+        relationship_list = [relationships[k] for k in sorted(relationships)]
+
+        self.add_initializer(fields, relationship_list)
+        self.add_model_construct(fields, relationship_list)
 
         info.metadata[METADATA_KEY] = {
             "fields": {field.name: field.serialize() for field in fields},
-            "relationships": sorted(relationships),
+            "relationships": {k: relationships[k].serialize() for k in sorted(relationships)},
         }
         return True
 
-    def collect_members(self) -> tuple[list[SQLModelField], set[str]] | None:
+    def collect_members(self) -> tuple[list[SQLModelField], dict[str, SQLModelRelationship]] | None:
         cls = self._cls
         info = cls.info
 
         found_fields: dict[str, SQLModelField] = {}
-        found_relationships: set[str] = set()
+        found_relationships: dict[str, SQLModelRelationship] = {}
 
         # 1) Inherited fields (base first).
         for base_info in reversed(info.mro[1:-1]):  # exclude current class and object
@@ -251,9 +312,25 @@ class SQLModelTransformer:
                 base_field.expand_typevar_from_subtype(info, self._api)
                 found_fields[name] = base_field
 
-            for name in base_metadata.get("relationships", []):
-                if isinstance(name, str):
-                    found_relationships.add(name)
+            rels = base_metadata.get("relationships", {})
+            if isinstance(rels, dict):
+                for name, data in rels.items():
+                    if not isinstance(name, str) or not isinstance(data, dict):
+                        continue
+                    base_rel = SQLModelRelationship.deserialize(base_info, data, self._api)
+                    base_rel.expand_typevar_from_subtype(info, self._api)
+                    found_relationships[name] = base_rel
+            elif isinstance(rels, list):
+                # Backwards compatibility with older metadata formats.
+                for item in rels:
+                    if isinstance(item, str):
+                        found_relationships[item] = SQLModelRelationship(
+                            name=item, line=base_info.line, column=base_info.column
+                        )
+                    elif isinstance(item, dict) and isinstance(item.get("name"), str):
+                        base_rel = SQLModelRelationship.deserialize(base_info, item, self._api)
+                        base_rel.expand_typevar_from_subtype(info, self._api)
+                        found_relationships[base_rel.name] = base_rel
 
         # 2) Current class fields.
         for stmt in self._get_assignment_statements_from_block(cls.defs):
@@ -261,11 +338,11 @@ class SQLModelTransformer:
             if member is None:
                 continue
             if isinstance(member, SQLModelField):
-                found_relationships.discard(member.name)
+                found_relationships.pop(member.name, None)
                 found_fields[member.name] = member
             else:
                 found_fields.pop(member.name, None)
-                found_relationships.add(member.name)
+                found_relationships[member.name] = member
 
         return list(found_fields.values()), found_relationships
 
@@ -314,7 +391,13 @@ class SQLModelTransformer:
             isinstance(stmt.rvalue, CallExpr)
             and _callee_fullname(stmt.rvalue) == SQLMODEL_RELATIONSHIP_FULLNAME
         ):
-            return SQLModelRelationship(name=name, line=stmt.line, column=stmt.column)
+            rel = SQLModelRelationship(name=name, line=stmt.line, column=stmt.column)
+            rel.info = self._cls.info
+            # Best-effort: keep the declared annotation type for typing relationship kwargs.
+            sym = self._cls.info.names.get(name)
+            if sym is not None and isinstance(sym.node, Var) and not sym.node.is_classvar:
+                rel.type = sym.node.type
+            return rel
 
         sym = self._cls.info.names.get(name)
         if sym is None or sym.node is None:
@@ -363,7 +446,9 @@ class SQLModelTransformer:
 
         return True
 
-    def add_initializer(self, fields: list[SQLModelField]) -> None:
+    def add_initializer(
+        self, fields: list[SQLModelField], relationships: list[SQLModelRelationship]
+    ) -> None:
         info = self._cls.info
 
         if "__init__" in info.names and not info.names["__init__"].plugin_generated:
@@ -392,6 +477,26 @@ class SQLModelTransformer:
                 )
             )
 
+        if _is_table_model(info):
+            for rel in relationships:
+                expanded = rel.expand_type(info, self._api, force_typevars_invariant=True)
+                if expanded is not None:
+                    expanded = expanded.accept(ForceInvariantTypeVars())
+                    expanded = _unwrap_mapped_type(expanded)
+                if typed and expanded is not None:
+                    type_annotation = expanded
+                else:
+                    type_annotation = AnyType(TypeOfAny.explicit)
+                variable = Var(rel.name, type_annotation)
+                args.append(
+                    Argument(
+                        variable=variable,
+                        type_annotation=type_annotation,
+                        initializer=None,
+                        kind=ARG_NAMED_OPT,
+                    )
+                )
+
         if not self.plugin_config.init_forbid_extra:
             kw = AnyType(TypeOfAny.explicit)
             kwargs_var = Var("kwargs", kw)
@@ -399,7 +504,9 @@ class SQLModelTransformer:
 
         add_method(self._api, self._cls, "__init__", args=args, return_type=NoneType())
 
-    def add_model_construct(self, fields: list[SQLModelField]) -> None:
+    def add_model_construct(
+        self, fields: list[SQLModelField], relationships: list[SQLModelRelationship]
+    ) -> None:
         info = self._cls.info
 
         if "model_construct" in info.names and not info.names["model_construct"].plugin_generated:
@@ -429,6 +536,23 @@ class SQLModelTransformer:
                     kind=ARG_NAMED_OPT if field.has_default else ARG_NAMED,
                 )
             )
+
+        if _is_table_model(info):
+            for rel in relationships:
+                expanded = rel.expand_type(info, self._api, force_typevars_invariant=True)
+                if expanded is not None:
+                    expanded = expanded.accept(ForceInvariantTypeVars())
+                    expanded = _unwrap_mapped_type(expanded)
+                type_annotation = expanded or AnyType(TypeOfAny.explicit)
+                variable = Var(rel.name, type_annotation)
+                args.append(
+                    Argument(
+                        variable=variable,
+                        type_annotation=type_annotation,
+                        initializer=None,
+                        kind=ARG_NAMED_OPT,
+                    )
+                )
 
         if not self.plugin_config.init_forbid_extra:
             kw = AnyType(TypeOfAny.explicit)
@@ -464,6 +588,30 @@ def _unwrap_mapped_type(typ: Type) -> Type:
             return proper.args[0]
         return AnyType(TypeOfAny.from_omitted_generics)
     return typ
+
+
+def _is_bool_nameexpr(expr: Expression, value: bool) -> bool:
+    if not isinstance(expr, NameExpr):
+        return False
+    if value:
+        return expr.fullname == "builtins.True" or expr.name == "True"
+    return expr.fullname == "builtins.False" or expr.name == "False"
+
+
+def _is_table_model(info: TypeInfo) -> bool:
+    """Best-effort detection for `class Model(SQLModel, table=True)`."""
+    kw = info.defn.keywords.get("table")
+    if kw is not None:
+        return _is_bool_nameexpr(kw, True)
+
+    # Inherit `table=True` from bases if present.
+    for base in info.mro[1:]:
+        if base.fullname == SQLMODEL_BASEMODEL_FULLNAME:
+            continue
+        kw = base.defn.keywords.get("table")
+        if kw is not None and _is_bool_nameexpr(kw, True):
+            return True
+    return False
 
 
 def add_method(

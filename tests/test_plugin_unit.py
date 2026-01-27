@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 from mypy.nodes import (
     ARG_NAMED,
+    ARG_NAMED_OPT,
     ARG_OPT,
+    ARG_POS,
     ARG_STAR2,
     Block,
     CallExpr,
@@ -20,14 +22,24 @@ from mypy.nodes import (
     Var,
 )
 from mypy.options import Options
-from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodSigContext
+from mypy.plugin import (
+    AttributeContext,
+    FunctionContext,
+    FunctionSigContext,
+    MethodContext,
+    MethodSigContext,
+)
 from mypy.types import (
     AnyType,
     CallableType,
     Instance,
+    NoneType,
+    TupleType,
     Type,
     TypeOfAny,
     TypeType,
+    UnionType,
+    get_proper_type,
 )
 
 import sqlmodel_mypy.plugin as plugin_mod
@@ -291,6 +303,346 @@ def test_constructor_signature_hook_collects_fields_and_skips_relationships() ->
     assert isinstance(sig, CallableType)
     assert sig.arg_names == ["y", "kwargs"]
     assert sig.arg_kinds == [ARG_NAMED, ARG_STAR2]
+
+
+def test_constructor_signature_hook_includes_relationship_kwargs_for_table_model() -> None:
+    model_info = make_sqlmodel_class("m.User")
+    model_info.defn.keywords["table"] = NameExpr("True")
+
+    int_info = make_typeinfo("builtins.int")
+    int_t = Instance(int_info, [])
+
+    team_info = make_typeinfo("m.Team")
+    team_t = Instance(team_info, [])
+
+    # name: int = Field()
+    name_var = Var("name", int_t)
+    model_info.names["name"] = SymbolTableNode(0, name_var)
+    stmt_name = plugin_mod.AssignmentStmt(
+        [NameExpr("name")], make_call(plugin_mod.SQLMODEL_FIELD_FULLNAME)
+    )
+    stmt_name.new_syntax = True
+    model_info.defn.defs.body.append(stmt_name)
+
+    # team: Team = Relationship()
+    team_var = Var("team", team_t)
+    model_info.names["team"] = SymbolTableNode(0, team_var)
+    stmt_team = plugin_mod.AssignmentStmt(
+        [NameExpr("team")], make_call(plugin_mod.SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_team.new_syntax = True
+    model_info.defn.defs.body.append(stmt_team)
+
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    p.plugin_config.init_typed = True
+    p.plugin_config.init_forbid_extra = True
+    p.lookup_fully_qualified = lambda full: SimpleNamespace(  # type: ignore[method-assign]
+        node={"m.User": model_info}.get(full)
+    )
+
+    api = DummyCheckerAPI()
+    default_sig = CallableType(
+        [], [], [], Instance(model_info, []), Instance(make_typeinfo("builtins.function"), [])
+    )
+    hook = p.get_function_signature_hook("m.User")
+    assert hook is not None
+    sig = hook(
+        FunctionSigContext(args=[], default_signature=default_sig, context=NameExpr("x"), api=api)
+    )
+    assert isinstance(sig, CallableType)
+    assert sig.arg_names == ["name", "team"]
+    assert sig.arg_kinds == [ARG_NAMED, ARG_NAMED_OPT]
+
+    assert isinstance(sig.arg_types[0], Instance)
+    assert sig.arg_types[0].type.fullname == "builtins.int"
+    assert isinstance(sig.arg_types[1], Instance)
+    assert sig.arg_types[1].type.fullname == "m.Team"
+
+
+def test_model_construct_signature_hook_includes_relationship_kwargs_for_table_model() -> None:
+    model_info = make_sqlmodel_class("m.User")
+    model_info.defn.keywords["table"] = NameExpr("True")
+
+    int_info = make_typeinfo("builtins.int")
+    int_t = Instance(int_info, [])
+
+    team_info = make_typeinfo("m.Team")
+    team_t = Instance(team_info, [])
+
+    var = Var("x", int_t)
+    model_info.names["x"] = SymbolTableNode(0, var)
+    stmt = plugin_mod.AssignmentStmt([NameExpr("x")], make_call(plugin_mod.SQLMODEL_FIELD_FULLNAME))
+    stmt.new_syntax = True
+    model_info.defn.defs.body.append(stmt)
+
+    team_var = Var("team", team_t)
+    model_info.names["team"] = SymbolTableNode(0, team_var)
+    stmt_team = plugin_mod.AssignmentStmt(
+        [NameExpr("team")], make_call(plugin_mod.SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_team.new_syntax = True
+    model_info.defn.defs.body.append(stmt_team)
+
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+    default_sig = CallableType(
+        [], [], [], Instance(model_info, []), Instance(make_typeinfo("builtins.function"), [])
+    )
+    ctx = MethodSigContext(
+        type=TypeType(Instance(model_info, [])),
+        args=[],
+        default_signature=default_sig,
+        context=NameExpr("x"),
+        api=api,
+    )
+    sig = p._sqlmodel_model_construct_signature_callback(ctx)  # type: ignore[arg-type]
+    assert isinstance(sig, CallableType)
+    assert sig.arg_names[:3] == ["_fields_set", "x", "team"]
+    assert sig.arg_kinds[:3] == [ARG_OPT, ARG_NAMED, ARG_NAMED_OPT]
+
+
+def test_select_join_isouter_true_makes_joined_entity_optional_in_return_type() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    hero_info = make_typeinfo("m.Hero")
+    team_info = make_typeinfo("m.Team")
+
+    tuple_info = make_typeinfo("builtins.tuple")
+    fallback = Instance(tuple_info, [AnyType(TypeOfAny.explicit)])
+    tp = TupleType([Instance(hero_info, []), Instance(team_info, [])], fallback)
+
+    select_info = make_typeinfo("sqlalchemy.sql.selectable.Select")
+    select_inst = Instance(select_info, [tp])
+
+    team_expr = NameExpr("Team")
+    team_expr.node = team_info
+
+    true_expr = NameExpr("True")
+
+    call = CallExpr(
+        NameExpr("join"),
+        [team_expr, true_expr],
+        [ARG_POS, ARG_NAMED],
+        [None, "isouter"],
+    )
+
+    hook = p.get_method_hook("sqlalchemy.sql.selectable.Select.join")
+    assert hook is not None
+
+    ctx = MethodContext(
+        type=select_inst,
+        arg_types=[
+            [TypeType(Instance(team_info, []))],
+            [Instance(make_typeinfo("builtins.bool"), [])],
+        ],
+        arg_kinds=[[ARG_POS], [ARG_NAMED]],
+        callee_arg_names=["target", "isouter"],
+        arg_names=[[None], ["isouter"]],
+        default_return_type=select_inst,
+        args=[[team_expr], [true_expr]],
+        context=call,
+        api=DummyCheckerAPI(),
+    )
+    t = hook(ctx)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    assert proper.type.fullname == "sqlalchemy.sql.selectable.Select"
+    assert proper.args
+    tp2 = get_proper_type(proper.args[0])
+    assert isinstance(tp2, TupleType)
+    assert len(tp2.items) == 2
+    assert isinstance(get_proper_type(tp2.items[0]), Instance)
+    second = get_proper_type(tp2.items[1])
+    assert isinstance(second, UnionType)
+    assert any(isinstance(get_proper_type(it), NoneType) for it in second.items)
+
+
+def test_select_join_without_isouter_keeps_return_type() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    hero_info = make_typeinfo("m.Hero")
+    team_info = make_typeinfo("m.Team")
+
+    tuple_info = make_typeinfo("builtins.tuple")
+    fallback = Instance(tuple_info, [AnyType(TypeOfAny.explicit)])
+    tp = TupleType([Instance(hero_info, []), Instance(team_info, [])], fallback)
+
+    select_info = make_typeinfo("sqlalchemy.sql.selectable.Select")
+    select_inst = Instance(select_info, [tp])
+
+    team_expr = NameExpr("Team")
+    team_expr.node = team_info
+
+    call = CallExpr(NameExpr("join"), [team_expr], [ARG_POS], [None])
+
+    hook = p.get_method_hook("sqlalchemy.sql.selectable.Select.join")
+    assert hook is not None
+
+    ctx = MethodContext(
+        type=select_inst,
+        arg_types=[[TypeType(Instance(team_info, []))]],
+        arg_kinds=[[ARG_POS]],
+        callee_arg_names=["target"],
+        arg_names=[[None]],
+        default_return_type=select_inst,
+        args=[[team_expr]],
+        context=call,
+        api=DummyCheckerAPI(),
+    )
+    t = hook(ctx)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    tp2 = get_proper_type(proper.args[0])
+    assert isinstance(tp2, TupleType)
+    assert isinstance(get_proper_type(tp2.items[1]), Instance)
+
+
+def test_select_join_isouter_false_keeps_return_type() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    hero_info = make_typeinfo("m.Hero")
+    team_info = make_typeinfo("m.Team")
+
+    tuple_info = make_typeinfo("builtins.tuple")
+    fallback = Instance(tuple_info, [AnyType(TypeOfAny.explicit)])
+    tp = TupleType([Instance(hero_info, []), Instance(team_info, [])], fallback)
+
+    select_info = make_typeinfo("sqlalchemy.sql.selectable.Select")
+    select_inst = Instance(select_info, [tp])
+
+    team_expr = NameExpr("Team")
+    team_expr.node = team_info
+
+    false_expr = NameExpr("False")
+
+    call = CallExpr(
+        NameExpr("join"),
+        [team_expr, false_expr],
+        [ARG_POS, ARG_NAMED],
+        [None, "isouter"],
+    )
+
+    hook = p.get_method_hook("sqlalchemy.sql.selectable.Select.join")
+    assert hook is not None
+
+    ctx = MethodContext(
+        type=select_inst,
+        arg_types=[
+            [TypeType(Instance(team_info, []))],
+            [Instance(make_typeinfo("builtins.bool"), [])],
+        ],
+        arg_kinds=[[ARG_POS], [ARG_NAMED]],
+        callee_arg_names=["target", "isouter"],
+        arg_names=[[None], ["isouter"]],
+        default_return_type=select_inst,
+        args=[[team_expr], [false_expr]],
+        context=call,
+        api=DummyCheckerAPI(),
+    )
+    t = hook(ctx)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    tp2 = get_proper_type(proper.args[0])
+    assert isinstance(tp2, TupleType)
+    assert isinstance(get_proper_type(tp2.items[1]), Instance)
+
+
+def test_select_join_from_isouter_true_makes_target_optional_in_return_type() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    hero_info = make_typeinfo("m.Hero")
+    team_info = make_typeinfo("m.Team")
+
+    tuple_info = make_typeinfo("builtins.tuple")
+    fallback = Instance(tuple_info, [AnyType(TypeOfAny.explicit)])
+    tp = TupleType([Instance(hero_info, []), Instance(team_info, [])], fallback)
+
+    select_info = make_typeinfo("sqlalchemy.sql.selectable.Select")
+    select_inst = Instance(select_info, [tp])
+
+    hero_expr = NameExpr("Hero")
+    hero_expr.node = hero_info
+
+    team_expr = NameExpr("Team")
+    team_expr.node = team_info
+
+    true_expr = NameExpr("True")
+
+    call = CallExpr(
+        NameExpr("join_from"),
+        [hero_expr, team_expr, true_expr],
+        [ARG_POS, ARG_POS, ARG_NAMED],
+        [None, None, "isouter"],
+    )
+
+    hook = p.get_method_hook("sqlalchemy.sql.selectable.Select.join_from")
+    assert hook is not None
+
+    ctx = MethodContext(
+        type=select_inst,
+        arg_types=[
+            [TypeType(Instance(hero_info, []))],
+            [TypeType(Instance(team_info, []))],
+            [Instance(make_typeinfo("builtins.bool"), [])],
+        ],
+        arg_kinds=[[ARG_POS], [ARG_POS], [ARG_NAMED]],
+        callee_arg_names=["from_", "target", "isouter"],
+        arg_names=[[None], [None], ["isouter"]],
+        default_return_type=select_inst,
+        args=[[hero_expr], [team_expr], [true_expr]],
+        context=call,
+        api=DummyCheckerAPI(),
+    )
+    t = hook(ctx)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    tp2 = get_proper_type(proper.args[0])
+    assert isinstance(tp2, TupleType)
+    second = get_proper_type(tp2.items[1])
+    assert isinstance(second, UnionType)
+    assert any(isinstance(get_proper_type(it), NoneType) for it in second.items)
+
+
+def test_select_outerjoin_makes_target_optional_in_return_type() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    hero_info = make_typeinfo("m.Hero")
+    team_info = make_typeinfo("m.Team")
+
+    tuple_info = make_typeinfo("builtins.tuple")
+    fallback = Instance(tuple_info, [AnyType(TypeOfAny.explicit)])
+    tp = TupleType([Instance(hero_info, []), Instance(team_info, [])], fallback)
+
+    select_info = make_typeinfo("sqlalchemy.sql.selectable.Select")
+    select_inst = Instance(select_info, [tp])
+
+    team_expr = NameExpr("Team")
+    team_expr.node = team_info
+
+    call = CallExpr(NameExpr("outerjoin"), [team_expr], [ARG_POS], [None])
+
+    hook = p.get_method_hook("sqlalchemy.sql.selectable.Select.outerjoin")
+    assert hook is not None
+
+    ctx = MethodContext(
+        type=select_inst,
+        arg_types=[[TypeType(Instance(team_info, []))]],
+        arg_kinds=[[ARG_POS]],
+        callee_arg_names=["target"],
+        arg_names=[[None]],
+        default_return_type=select_inst,
+        args=[[team_expr]],
+        context=call,
+        api=DummyCheckerAPI(),
+    )
+    t = hook(ctx)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    tp2 = get_proper_type(proper.args[0])
+    assert isinstance(tp2, TupleType)
+    second = get_proper_type(tp2.items[1])
+    assert isinstance(second, UnionType)
+    assert any(isinstance(get_proper_type(it), NoneType) for it in second.items)
 
 
 def test_constructor_signature_unwraps_mapped_when_typed() -> None:

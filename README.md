@@ -7,7 +7,7 @@ Mypy plugin that improves type checking for [`SQLModel`](https://github.com/fast
 Early/experimental. Current scope:
 
 - Generate correct `__init__` / `model_construct` signatures for SQLModel models (treat `sqlmodel.Field(...)`
-  required/optional correctly; ignore `sqlmodel.Relationship(...)` in constructors).
+  required/optional correctly; accept `sqlmodel.Relationship(...)` kwargs for `table=True` models).
 - Improve SQLAlchemy expression typing for **class** attribute access (e.g. `User.id`, `User.name`).
 
 ## Install (dev)
