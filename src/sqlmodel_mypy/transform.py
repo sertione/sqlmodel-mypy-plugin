@@ -11,10 +11,12 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any, Protocol
 
+from mypy.errorcodes import ErrorCode
 from mypy.expandtype import expand_type
 from mypy.nodes import (
     ARG_NAMED,
     ARG_NAMED_OPT,
+    ARG_OPT,
     ARG_POS,
     ARG_STAR2,
     INVARIANT,
@@ -24,6 +26,7 @@ from mypy.nodes import (
     Block,
     CallExpr,
     ClassDef,
+    Decorator,
     EllipsisExpr,
     Expression,
     FuncDef,
@@ -44,6 +47,7 @@ from mypy.plugins.common import deserialize_and_fixup_type
 from mypy.semanal import set_callable_name
 from mypy.server.trigger import make_wildcard_trigger
 from mypy.state import state
+from mypy.type_visitor import TypeTranslator
 from mypy.typeops import map_type_from_supertype
 from mypy.types import (
     AnyType,
@@ -51,9 +55,12 @@ from mypy.types import (
     Instance,
     NoneType,
     Type,
+    TypeAliasType,
     TypeOfAny,
     TypeType,
     TypeVarType,
+    UnionType,
+    get_proper_type,
 )
 from mypy.typevars import fill_typevars
 from mypy.util import get_unique_redefinition_name
@@ -62,6 +69,7 @@ from mypy.util import get_unique_redefinition_name
 class SQLModelPluginConfig(Protocol):
     init_typed: bool
     init_forbid_extra: bool
+    warn_untyped_fields: bool
 
 
 METADATA_KEY = "sqlmodel-mypy-metadata"
@@ -69,6 +77,19 @@ METADATA_KEY = "sqlmodel-mypy-metadata"
 SQLMODEL_BASEMODEL_FULLNAME = "sqlmodel.main.SQLModel"
 SQLMODEL_FIELD_FULLNAME = "sqlmodel.main.Field"
 SQLMODEL_RELATIONSHIP_FULLNAME = "sqlmodel.main.Relationship"
+
+ERROR_FIELD = ErrorCode("sqlmodel-field", "SQLModel field error", "SQLModel")
+
+
+class ForceInvariantTypeVars(TypeTranslator):
+    def visit_type_var(self, t: TypeVarType) -> Type:  # noqa: D102
+        if t.variance == INVARIANT:
+            return t
+        return t.copy_modified(variance=INVARIANT)
+
+    def visit_type_alias_type(self, t: TypeAliasType) -> Type:  # noqa: D102
+        # Expand type aliases and then continue translation.
+        return get_proper_type(t).accept(self)
 
 
 class SQLModelField:
@@ -170,6 +191,7 @@ class SQLModelTransformer:
                 return False
 
         self.add_initializer(fields)
+        self.add_model_construct(fields)
 
         info.metadata[METADATA_KEY] = {
             "fields": {field.name: field.serialize() for field in fields},
@@ -194,6 +216,13 @@ class SQLModelTransformer:
 
             self._api.add_plugin_dependency(make_wildcard_trigger(base_info.fullname))
             for name, data in base_info.metadata[METADATA_KEY]["fields"].items():
+                sym_node = info.names.get(name)
+                if sym_node and sym_node.node and not isinstance(sym_node.node, Var):
+                    self._api.fail(
+                        "SQLModel field may only be overridden by another field",
+                        sym_node.node,
+                        code=ERROR_FIELD,
+                    )
                 base_field = SQLModelField.deserialize(base_info, data, self._api)
                 base_field.expand_typevar_from_subtype(info, self._api)
                 found_fields[name] = base_field
@@ -224,8 +253,17 @@ class SQLModelTransformer:
                 yield from self._get_assignment_statements_from_if_statement(stmt)
 
     def collect_field_from_stmt(self, stmt: AssignmentStmt) -> SQLModelField | None:
-        # Only annotated assignments (`x: int = ...`); ignore untyped assignments.
+        # Untyped assignment (e.g. `x = Field(...)`).
         if not stmt.new_syntax:
+            lhs = stmt.lvalues[0]
+            if (
+                self.plugin_config.warn_untyped_fields
+                and isinstance(lhs, NameExpr)
+                and isinstance(stmt.rvalue, CallExpr)
+                and _callee_fullname(stmt.rvalue)
+                in {SQLMODEL_FIELD_FULLNAME, SQLMODEL_RELATIONSHIP_FULLNAME}
+            ):
+                self._api.fail("Untyped fields disallowed", stmt, code=ERROR_FIELD)
             return None
 
         lhs = stmt.lvalues[0]
@@ -301,6 +339,8 @@ class SQLModelTransformer:
         args: list[Argument] = []
         for field in fields:
             expanded = field.expand_type(info, self._api, force_typevars_invariant=True)
+            if expanded is not None:
+                expanded = expanded.accept(ForceInvariantTypeVars())
             if typed and expanded is not None:
                 type_annotation = expanded
             else:
@@ -322,6 +362,50 @@ class SQLModelTransformer:
             args.append(Argument(kwargs_var, kw, None, ARG_STAR2))
 
         add_method(self._api, self._cls, "__init__", args=args, return_type=NoneType())
+
+    def add_model_construct(self, fields: list[SQLModelField]) -> None:
+        info = self._cls.info
+
+        if "model_construct" in info.names and not info.names["model_construct"].plugin_generated:
+            return
+
+        set_str = self._api.named_type("builtins.set", [self._api.named_type("builtins.str")])
+        optional_set_str = UnionType([set_str, NoneType()])
+        fields_set_argument = Argument(
+            Var("_fields_set", optional_set_str), optional_set_str, None, ARG_OPT
+        )
+
+        args: list[Argument] = []
+        for field in fields:
+            expanded = field.expand_type(info, self._api, force_typevars_invariant=True)
+            # `model_construct` bypasses validation, so this is always typed.
+            if expanded is not None:
+                expanded = expanded.accept(ForceInvariantTypeVars())
+            type_annotation = expanded or AnyType(TypeOfAny.explicit)
+
+            variable = Var(field.name, type_annotation)
+            args.append(
+                Argument(
+                    variable=variable,
+                    type_annotation=type_annotation,
+                    initializer=None,
+                    kind=ARG_NAMED_OPT if field.has_default else ARG_NAMED,
+                )
+            )
+
+        if not self.plugin_config.init_forbid_extra:
+            kw = AnyType(TypeOfAny.explicit)
+            kwargs_var = Var("kwargs", kw)
+            args.append(Argument(kwargs_var, kw, None, ARG_STAR2))
+
+        add_method(
+            self._api,
+            self._cls,
+            "model_construct",
+            args=[fields_set_argument, *args],
+            return_type=fill_typevars(self._cls.info),
+            is_classmethod=True,
+        )
 
 
 def _callee_fullname(call: CallExpr) -> str | None:
@@ -388,7 +472,18 @@ def add_method(
     func._fullname = info.fullname + "." + name
     func.line = info.line
 
-    sym = SymbolTableNode(MDEF, func)
+    if is_classmethod:
+        func.is_decorated = True
+        v = Var(name, func.type)
+        v.info = info
+        v._fullname = func._fullname
+        v.is_classmethod = True
+        dec = Decorator(func, [NameExpr("classmethod")], v)
+        dec.line = info.line
+        sym = SymbolTableNode(MDEF, dec)
+    else:
+        sym = SymbolTableNode(MDEF, func)
+
     sym.plugin_generated = True
     info.names[name] = sym
     info.defn.defs.body.append(func)

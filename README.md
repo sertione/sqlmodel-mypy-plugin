@@ -39,6 +39,7 @@ plugins = sqlmodel_mypy.plugin, pydantic.mypy
 [sqlmodel-mypy]
 init_typed = false
 init_forbid_extra = false
+warn_untyped_fields = true
 ```
 
 `pyproject.toml`:
@@ -47,7 +48,12 @@ init_forbid_extra = false
 [tool.sqlmodel-mypy]
 init_typed = false
 init_forbid_extra = false
+warn_untyped_fields = true
 ```
+
+## Error codes
+
+- `sqlmodel-field`: field-related plugin errors (e.g. untyped `x = Field(...)`).
 
 ## Development
 

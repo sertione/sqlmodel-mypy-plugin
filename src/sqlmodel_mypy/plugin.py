@@ -18,7 +18,7 @@ SQLMODEL_BASEMODEL_FULLNAME = "sqlmodel.main.SQLModel"
 SQLMODEL_METACLASS_FULLNAME = "sqlmodel.main.SQLModelMetaclass"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 1
+__version__ = 2
 
 
 def plugin(version: str) -> type[Plugin]:
@@ -70,7 +70,12 @@ class SQLModelMypyPlugin(Plugin):
 
 
 class SQLModelPluginConfig:
-    __slots__ = ("init_typed", "init_forbid_extra", "warn_untyped_fields", "debug_dataclass_transform")
+    __slots__ = (
+        "init_typed",
+        "init_forbid_extra",
+        "warn_untyped_fields",
+        "debug_dataclass_transform",
+    )
 
     init_typed: bool
     init_forbid_extra: bool

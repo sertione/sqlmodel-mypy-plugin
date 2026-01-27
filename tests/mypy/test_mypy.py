@@ -22,6 +22,15 @@ os.chdir(REPO_ROOT)
 cases: list[tuple[str, str]] = [
     ("mypy-plugin.ini", "constructor.py"),
     ("mypy-plugin-strict.ini", "constructor.py"),
+    ("pyproject-plugin.toml", "constructor.py"),
+    ("mypy-plugin.ini", "untyped_fields.py"),
+    ("mypy-plugin-no-untyped.ini", "untyped_fields.py"),
+    ("mypy-plugin.ini", "inheritance.py"),
+    ("mypy-plugin.ini", "relationships.py"),
+    ("mypy-plugin-strict.ini", "relationships.py"),
+    ("mypy-plugin.ini", "model_construct.py"),
+    ("mypy-plugin-strict.ini", "model_construct.py"),
+    ("mypy-plugin-strict.ini", "generics.py"),
 ]
 
 
