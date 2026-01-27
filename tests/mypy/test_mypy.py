@@ -64,7 +64,8 @@ def test_mypy_results(
     config_path = REPO_ROOT / "tests/mypy/configs" / config_filename
     output_path = OUTPUTS_DIR / config_path.name.replace(".", "_") / input_path.name
 
-    cache_dir = f".mypy_cache/test-{os.path.splitext(config_filename)[0]}"
+    # Include pid to avoid cross-run incremental cache reuse (keeps coverage stable).
+    cache_dir = f".mypy_cache/test-{os.path.splitext(config_filename)[0]}-{os.getpid()}"
     command = [
         str(input_path),
         "--config-file",
