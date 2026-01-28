@@ -84,6 +84,12 @@ SQLMODEL_RELATIONSHIP_FULLNAME = "sqlmodel.main.Relationship"
 
 SQLALCHEMY_MAPPED_FULLNAMES = {"sqlalchemy.orm.Mapped", "sqlalchemy.orm.base.Mapped"}
 
+
+def _plugin_any() -> AnyType:
+    """Return an Any that should not trigger `disallow_any_explicit`."""
+    return AnyType(TypeOfAny.implementation_artifact)
+
+
 ERROR_FIELD = ErrorCode("sqlmodel-field", "SQLModel field error", "SQLModel")
 
 
@@ -559,7 +565,7 @@ class SQLModelTransformer:
             if typed and expanded is not None:
                 type_annotation = expanded
             else:
-                type_annotation = AnyType(TypeOfAny.explicit)
+                type_annotation = _plugin_any()
 
             field_aliases = [
                 alias
@@ -586,7 +592,7 @@ class SQLModelTransformer:
                 if typed and expanded is not None:
                     type_annotation = expanded
                 else:
-                    type_annotation = AnyType(TypeOfAny.explicit)
+                    type_annotation = _plugin_any()
                 variable = Var(rel.name, type_annotation)
                 args.append(
                     Argument(
@@ -614,7 +620,7 @@ class SQLModelTransformer:
                 )
 
         if not self.plugin_config.init_forbid_extra:
-            kw = AnyType(TypeOfAny.explicit)
+            kw = _plugin_any()
             kwargs_var = Var("kwargs", kw)
             args.append(Argument(kwargs_var, kw, None, ARG_STAR2))
 
@@ -651,7 +657,7 @@ class SQLModelTransformer:
             if expanded is not None:
                 expanded = expanded.accept(ForceInvariantTypeVars())
                 expanded = _unwrap_mapped_type(expanded)
-            type_annotation = expanded or AnyType(TypeOfAny.explicit)
+            type_annotation = expanded or _plugin_any()
 
             field_aliases = [
                 alias
@@ -675,7 +681,7 @@ class SQLModelTransformer:
                 if expanded is not None:
                     expanded = expanded.accept(ForceInvariantTypeVars())
                     expanded = _unwrap_mapped_type(expanded)
-                type_annotation = expanded or AnyType(TypeOfAny.explicit)
+                type_annotation = expanded or _plugin_any()
                 variable = Var(rel.name, type_annotation)
                 args.append(
                     Argument(
@@ -703,7 +709,7 @@ class SQLModelTransformer:
                 )
 
         if not self.plugin_config.init_forbid_extra:
-            kw = AnyType(TypeOfAny.explicit)
+            kw = _plugin_any()
             kwargs_var = Var("kwargs", kw)
             args.append(Argument(kwargs_var, kw, None, ARG_STAR2))
 

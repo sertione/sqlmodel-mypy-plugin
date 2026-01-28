@@ -44,6 +44,7 @@ cases: list[tuple[str, str]] = [
     ("mypy-plugin-strict.ini", "model_construct.py"),
     ("mypy-plugin-strict.ini", "generics.py"),
     ("mypy-plugin.ini", "expressions.py"),
+    ("mypy-plugin-strict-no-explicit-any.ini", "expression_typing_strict.py"),
     ("mypy-plugin.ini", "label.py"),
     ("mypy-plugin-strict.ini", "label.py"),
     ("mypy-plugin.ini", "relationship_expressions.py"),

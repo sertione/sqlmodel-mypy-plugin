@@ -14,7 +14,7 @@ class Hero(SQLModel, table=True):
 
 
 Hero(team=None)
-# MYPY: error: Missing named argument "name"  [call-arg]
+# MYPY: error: Missing named argument "name" for "__init__" of "Hero"  [call-arg]
 Hero(name="x", team=None)
 
 Team(name="t", heroes=[])

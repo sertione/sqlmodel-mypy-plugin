@@ -27,9 +27,9 @@ TableModel(full_name="x", years=1)
 
 # Type errors only when init_typed=true
 DataModel(full_name=1)
-# MYPY: error: Argument "full_name" has incompatible type "int"; expected "str"  [arg-type]
+# MYPY: error: Argument "full_name" to "__init__" of "DataModel" has incompatible type "int"; expected "str"  [arg-type]
 TableModel(full_name=1)
-# MYPY: error: Argument "full_name" has incompatible type "int"; expected "str"  [arg-type]
+# MYPY: error: Argument "full_name" to "__init__" of "TableModel" has incompatible type "int"; expected "str"  [arg-type]
 
 # model_construct is always typed (independent of init_typed)
 DataModel.model_construct(full_name="x")

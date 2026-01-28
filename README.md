@@ -25,7 +25,7 @@ Planned work is tracked in [`ROADMAP.md`](ROADMAP.md).
 - Accept SQLAlchemy TypeEngine instances in `Field(sa_type=...)` (e.g. `DateTime(timezone=True)`, `String(50)`)
   without `# type: ignore` in strict mode.
 - Accept `model_config = ConfigDict(...)` overrides on SQLModel subclasses in strict mode.
-- Compatible with `pydantic.mypy` in either plugin order.
+- Compatible with `pydantic.mypy` **when `sqlmodel_mypy.plugin` is listed first**.
 
 ## Install (dev)
 
@@ -50,16 +50,32 @@ make check
 plugins = sqlmodel_mypy.plugin
 ```
 
-If you also use `pydantic.mypy`, you can list plugins in either order:
+If you also use `pydantic.mypy`, **`sqlmodel_mypy.plugin` must be listed first**:
 
 ```ini
 [mypy]
 plugins = sqlmodel_mypy.plugin, pydantic.mypy
-# or:
-# plugins = pydantic.mypy, sqlmodel_mypy.plugin
 ```
 
+This is not a preference: **mypy picks the first plugin that claims a hook**. If `pydantic.mypy` runs first, it
+can treat SQLModel classes as plain Pydantic models and you’ll get incorrect typing (e.g. missing `__table__`,
+broken SQLAlchemy expression types, and incorrect/empty constructor signatures).
+
 ## Plugin configuration
+
+All options are **boolean**.
+
+Supported options:
+
+- **`init_typed`** (default: `false`): Generate `__init__` / constructor signatures using the declared field types.
+  When `false`, the plugin uses `Any` for parameter types (but still enforces required/optional fields).
+- **`init_forbid_extra`** (default: `false`): When `true`, do **not** add `**kwargs: Any` to generated
+  `__init__` / `model_construct` / constructor signatures, so mypy reports unexpected keyword arguments.
+- **`warn_untyped_fields`** (default: `true`): When `true`, emit error code `sqlmodel-field` for untyped
+  declarations like `x = Field(...)` / `x = Relationship(...)` (use `x: T = ...` instead).
+- **`debug_dataclass_transform`** (default: `false`): **Advanced/debug-only**. When `true`, keep SQLModel’s
+  `__dataclass_transform__` handling enabled in mypy (useful for debugging plugin interactions; not recommended
+  for normal use).
 
 `mypy.ini`:
 
@@ -68,6 +84,7 @@ plugins = sqlmodel_mypy.plugin, pydantic.mypy
 init_typed = false
 init_forbid_extra = false
 warn_untyped_fields = true
+debug_dataclass_transform = false
 ```
 
 `pyproject.toml`:
@@ -77,6 +94,7 @@ warn_untyped_fields = true
 init_typed = false
 init_forbid_extra = false
 warn_untyped_fields = true
+debug_dataclass_transform = false
 ```
 
 ## Error codes

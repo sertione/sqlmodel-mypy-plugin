@@ -5,8 +5,9 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable, Iterator
 from configparser import ConfigParser
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
+from mypy.errorcodes import ErrorCode
 from mypy.nodes import (
     ARG_NAMED,
     ARG_NAMED_OPT,
@@ -19,7 +20,9 @@ from mypy.nodes import (
     AssignmentStmt,
     Block,
     CallExpr,
+    Decorator,
     Expression,
+    FuncDef,
     IfStmt,
     MemberExpr,
     NameExpr,
@@ -58,6 +61,7 @@ from mypy.typevars import fill_typevars
 
 from .transform import (
     ERROR_FIELD,
+    METADATA_KEY,
     SQLALCHEMY_MAPPED_FULLNAMES,
     SQLMODEL_FIELD_FULLNAME,
     SQLMODEL_RELATIONSHIP_FULLNAME,
@@ -70,6 +74,12 @@ from .transform import (
 CONFIGFILE_KEY = "sqlmodel-mypy"
 SQLMODEL_BASEMODEL_FULLNAME = "sqlmodel.main.SQLModel"
 SQLMODEL_METACLASS_FULLNAME = "sqlmodel.main.SQLModelMetaclass"
+
+ERROR_PLUGIN_ORDER = ErrorCode(
+    "sqlmodel-plugin-order",
+    "SQLModel plugin order error",
+    "SQLModel",
+)
 
 SQLMODEL_COL_FULLNAME = "sqlmodel.sql.expression.col"
 # SQLModel's `select()` is implemented in a generated module and re-exported.
@@ -134,7 +144,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 14
+__version__ = 15
 
 
 class _CollectedField(NamedTuple):
@@ -234,11 +244,113 @@ def _lookup_typeinfo(plugin: Plugin, fullname: str) -> TypeInfo | None:
     return None
 
 
+def _plugin_any() -> AnyType:
+    """Return an Any that should not trigger `disallow_any_explicit`."""
+    return AnyType(TypeOfAny.implementation_artifact)
+
+
+def _named_type_or_none(api: Any, fullname: str) -> Instance | None:
+    """Best-effort `api.named_type`/`api.named_generic_type` wrapper.
+
+    Prefer `named_type` (semantic analyzer) but fall back to `named_generic_type` (checker).
+    """
+    try:
+        if hasattr(api, "named_type"):
+            return cast(Instance, api.named_type(fullname))
+        if hasattr(api, "named_generic_type"):
+            return cast(Instance, api.named_generic_type(fullname, []))
+    except Exception:
+        return None
+    return None
+
+
+def _named_generic_type_or_none(api: Any, fullname: str, args: list[Type]) -> Instance | None:
+    """Best-effort wrapper for generic named types across mypy plugin APIs."""
+    try:
+        if hasattr(api, "named_generic_type"):
+            return cast(Instance, api.named_generic_type(fullname, args))
+        if hasattr(api, "named_type"):
+            return cast(Instance, api.named_type(fullname, args))
+    except Exception:
+        return None
+    return None
+
+
+def _plugins_from_config_file(config_file: str) -> list[str] | None:
+    """Best-effort extraction of `[mypy] plugins = ...` from mypy config files."""
+    toml_config = parse_toml(config_file)
+    if toml_config is not None:
+        plugins = toml_config.get("tool", {}).get("mypy", {}).get("plugins")
+        if isinstance(plugins, str):
+            return [p.strip() for p in plugins.split(",") if p.strip()]
+        if isinstance(plugins, list) and all(isinstance(p, str) for p in plugins):
+            return plugins
+        return None
+
+    parser = ConfigParser()
+    parser.read(config_file)
+    if not parser.has_section("mypy"):
+        return None
+    if not parser.has_option("mypy", "plugins"):
+        return None
+    raw = parser.get("mypy", "plugins")
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
 class SQLModelMypyPlugin(Plugin):
     def __init__(self, options: Options) -> None:
         self.plugin_config = SQLModelPluginConfig(options)
         self._plugin_data = {"__version__": __version__, **self.plugin_config.to_data()}
+        self._plugin_order_ok = True
+        self._reported_plugin_order = False
+        self._warmed_sqlalchemy_typing = False
+        plugins: list[str] | None = None
+        if options.config_file is not None:
+            plugins = _plugins_from_config_file(options.config_file)
+        if plugins is None:
+            raw_plugins = getattr(options, "plugins", None)
+            if isinstance(raw_plugins, (list, tuple)):
+                plugins = list(raw_plugins)
+        if plugins is not None:
+            try:
+                sqlmodel_idx = plugins.index("sqlmodel_mypy.plugin")
+                pydantic_idx = plugins.index("pydantic.mypy")
+            except ValueError:
+                pass
+            else:
+                self._plugin_order_ok = sqlmodel_idx < pydantic_idx
         super().__init__(options)
+
+    def _warm_sqlalchemy_typing(self, api: Any) -> None:
+        """Best-effort preloading of SQLAlchemy typing symbols.
+
+        Some mypy plugin APIs only resolve types from already-loaded modules. Ensure
+        core SQLAlchemy types are loaded before type-checking hooks run.
+        """
+        if self._warmed_sqlalchemy_typing:
+            return
+        self._warmed_sqlalchemy_typing = True
+
+        any_t = _plugin_any()
+        bool_t = api.named_type("builtins.bool")
+        for fullname, args in (
+            ("sqlalchemy.orm.attributes.InstrumentedAttribute", [any_t]),
+            ("sqlalchemy.orm.InstrumentedAttribute", [any_t]),
+            ("sqlalchemy.orm.attributes.QueryableAttribute", [any_t]),
+            ("sqlalchemy.orm.base.Mapped", [any_t]),
+            ("sqlalchemy.orm.Mapped", [any_t]),
+            ("sqlalchemy.sql.elements.ColumnElement", [bool_t]),
+            ("sqlalchemy.sql.schema.Table", None),
+            ("sqlalchemy.sql.schema.TableClause", None),
+            ("sqlalchemy.sql.selectable.FromClause", None),
+        ):
+            try:
+                if args is None:
+                    api.named_type(fullname)
+                else:
+                    api.named_type(fullname, args)
+            except Exception:
+                continue
 
     def get_function_signature_hook(
         self, fullname: str
@@ -331,7 +443,7 @@ class SQLModelMypyPlugin(Plugin):
             return None
 
         if attr_name == "__table__":
-            return lambda _ctx: self._sqlalchemy_table_type()
+            return lambda ctx: self._sqlalchemy_table_type(ctx.api)
 
         if not self._declares_sqlmodel_member(owner_info, attr_name):
             return None
@@ -352,6 +464,18 @@ class SQLModelMypyPlugin(Plugin):
 
     def _declares_sqlmodel_member(self, info: TypeInfo, name: str) -> bool:
         """Return True if `name` is declared as a field/relationship on `info`."""
+        # Preferred: metadata-driven. This avoids relying on class-body AST shape at hook time.
+        md = info.metadata.get(METADATA_KEY)
+        if isinstance(md, dict):
+            fields = md.get("fields")
+            if isinstance(fields, dict) and name in fields:
+                return True
+            rels = md.get("relationships")
+            if isinstance(rels, dict) and name in rels:
+                return True
+            if isinstance(rels, list) and name in rels:
+                return True
+
         # Fast path: if it isn't even a Var on the class, it's not a model member.
         sym = info.names.get(name)
         if sym is None or sym.node is None or not isinstance(sym.node, Var) or sym.node.is_classvar:
@@ -509,6 +633,32 @@ class SQLModelMypyPlugin(Plugin):
     def _sqlmodel_constructor_signature_callback(
         self, ctx: FunctionSigContext, info: TypeInfo
     ) -> FunctionLike:
+        # Preferred: derive the class-call signature from the plugin-generated `__init__`.
+        # This avoids re-scanning the class body AST at type-check time (which is brittle,
+        # especially with compiled mypy) and matches what users see in `reveal_type(Model.__init__)`.
+        init_sym = info.names.get("__init__")
+        if init_sym is not None and init_sym.plugin_generated:
+            init_node = init_sym.node
+            init_type: CallableType | None = None
+            if isinstance(init_node, Var):
+                if isinstance(init_node.type, CallableType):
+                    init_type = init_node.type
+            elif isinstance(init_node, FuncDef):
+                if isinstance(init_node.type, CallableType):
+                    init_type = init_node.type
+            elif isinstance(init_node, Decorator):
+                if isinstance(init_node.func.type, CallableType):
+                    init_type = init_node.func.type
+
+            if init_type is not None and len(init_type.arg_types) >= 1:
+                return init_type.copy_modified(
+                    arg_types=init_type.arg_types[1:],
+                    arg_kinds=init_type.arg_kinds[1:],
+                    arg_names=init_type.arg_names[1:],
+                    ret_type=ctx.default_signature.ret_type,
+                    fallback=ctx.default_signature.fallback,
+                )
+
         fields, relationships = self._collect_members_for_signature(info, ctx.api)
 
         arg_types: list[Type] = []
@@ -530,7 +680,7 @@ class SQLModelMypyPlugin(Plugin):
                 t = f.type.accept(ForceInvariantTypeVars())
                 t = _unwrap_mapped_type(t)
             else:
-                t = AnyType(TypeOfAny.explicit)
+                t = _plugin_any()
             field_aliases = [
                 alias for alias in f.aliases if alias != f.name and alias not in canonical_names
             ]
@@ -545,7 +695,7 @@ class SQLModelMypyPlugin(Plugin):
                     t = rel.type.accept(ForceInvariantTypeVars())
                     t = _unwrap_mapped_type(t)
                 else:
-                    t = AnyType(TypeOfAny.explicit)
+                    t = _plugin_any()
                 arg_types.append(t)
                 arg_names.append(rel.name)
                 arg_kinds.append(ARG_NAMED_OPT)
@@ -561,7 +711,7 @@ class SQLModelMypyPlugin(Plugin):
                 arg_kinds.append(ARG_NAMED_OPT)
 
         if not self.plugin_config.init_forbid_extra:
-            kw = AnyType(TypeOfAny.explicit)
+            kw = _plugin_any()
             arg_types.append(kw)
             arg_names.append("kwargs")
             arg_kinds.append(ARG_STAR2)
@@ -609,7 +759,7 @@ class SQLModelMypyPlugin(Plugin):
         if _contains_instance_fullname(old_sa_type, type_engine_info.fullname):
             return default
 
-        any_t = AnyType(TypeOfAny.explicit)
+        any_t = _plugin_any()
         type_engine_args = [any_t] * len(type_engine_info.defn.type_vars)
         type_engine_instance = Instance(type_engine_info, type_engine_args)
 
@@ -668,7 +818,7 @@ class SQLModelMypyPlugin(Plugin):
         if select_info is None:
             return ctx.default_signature
 
-        any_t = AnyType(TypeOfAny.explicit)
+        any_t = _plugin_any()
         tuple_fallback = ctx.api.named_generic_type("builtins.tuple", [any_t])
         row_type = TupleType([any_t] * positional_count, tuple_fallback)
         ret_type = Instance(select_info, [row_type])
@@ -721,11 +871,7 @@ class SQLModelMypyPlugin(Plugin):
 
         field_params: list[tuple[Type, list[str]]] = []
         for f in fields:
-            t = (
-                f.type.accept(ForceInvariantTypeVars())
-                if f.type is not None
-                else AnyType(TypeOfAny.explicit)
-            )
+            t = f.type.accept(ForceInvariantTypeVars()) if f.type is not None else _plugin_any()
             t = _unwrap_mapped_type(t)
             field_aliases = [
                 alias for alias in f.aliases if alias != f.name and alias not in canonical_names
@@ -740,7 +886,7 @@ class SQLModelMypyPlugin(Plugin):
                 t = (
                     rel.type.accept(ForceInvariantTypeVars())
                     if rel.type is not None
-                    else AnyType(TypeOfAny.explicit)
+                    else _plugin_any()
                 )
                 t = _unwrap_mapped_type(t)
                 arg_types.append(t)
@@ -758,7 +904,7 @@ class SQLModelMypyPlugin(Plugin):
                 arg_kinds.append(ARG_NAMED_OPT)
 
         if not self.plugin_config.init_forbid_extra:
-            kw = AnyType(TypeOfAny.explicit)
+            kw = _plugin_any()
             arg_types.append(kw)
             arg_names.append("kwargs")
             arg_kinds.append(ARG_STAR2)
@@ -902,7 +1048,7 @@ class SQLModelMypyPlugin(Plugin):
         try:
             return ctx.api.named_generic_type("sqlalchemy.sql.elements.ColumnElement", [bool_t])
         except Exception:
-            return AnyType(TypeOfAny.explicit)
+            return _plugin_any()
 
     def _sqlalchemy_select_join_like_return_type(
         self, ctx: MethodContext, *, target_positional_index: int, isouter_always: bool
@@ -971,13 +1117,24 @@ class SQLModelMypyPlugin(Plugin):
             if proper.type.fullname in SQLALCHEMY_INSTRUMENTED_ATTRIBUTE_FULLNAMES:
                 return default
 
-        inst_attr_info = _lookup_typeinfo(
-            self, "sqlalchemy.orm.attributes.InstrumentedAttribute"
-        ) or _lookup_typeinfo(self, "sqlalchemy.orm.InstrumentedAttribute")
-        if inst_attr_info is None:
-            return default
+        for fullname in (
+            "sqlalchemy.orm.attributes.InstrumentedAttribute",
+            "sqlalchemy.orm.InstrumentedAttribute",
+        ):
+            info = _lookup_typeinfo(self, fullname)
+            if info is not None:
+                return Instance(info, [default])
 
-        return Instance(inst_attr_info, [default])
+        # Fallback: if ORM attribute types aren't available, prefer a Core expression wrapper.
+        # This still enables common operator methods like `.in_(...)` and `.like(...)`.
+        for fullname in (
+            "sqlalchemy.sql.elements.ColumnElement",
+            "sqlalchemy.sql.expression.ColumnElement",
+        ):
+            info = _lookup_typeinfo(self, fullname)
+            if info is not None:
+                return Instance(info, [default])
+        return default
 
     def _sqlmodel_col_return_type_callback(self, ctx: FunctionContext) -> Type:
         # `col()` is effectively a typed identity/cast helper.
@@ -996,13 +1153,11 @@ class SQLModelMypyPlugin(Plugin):
         if value_type is None:
             return ctx.default_return_type
 
-        mapped_info = _lookup_typeinfo(self, "sqlalchemy.orm.base.Mapped") or _lookup_typeinfo(
-            self, "sqlalchemy.orm.Mapped"
-        )
-        if mapped_info is None:
-            return ctx.default_return_type
-
-        return Instance(mapped_info, [value_type])
+        for fullname in ("sqlalchemy.orm.base.Mapped", "sqlalchemy.orm.Mapped"):
+            info = _lookup_typeinfo(self, fullname)
+            if info is not None:
+                return Instance(info, [value_type])
+        return ctx.default_return_type
 
     def _sqlmodel_model_class_callback(self, ctx: ClassDefContext) -> None:
         # SQLModel is built on Pydantic v2; users commonly override `model_config`
@@ -1011,6 +1166,7 @@ class SQLModelMypyPlugin(Plugin):
         # errors. Widen to a compatible supertype so `model_config = ConfigDict(...)`
         # is accepted without `# type: ignore`.
         self._widen_model_config_type(ctx)
+        self._warm_sqlalchemy_typing(ctx.api)
         transformer = SQLModelTransformer(ctx.cls, ctx.reason, ctx.api, self.plugin_config)
         transformer.transform()
         self._add_table_dunders(ctx)
@@ -1023,7 +1179,7 @@ class SQLModelMypyPlugin(Plugin):
         if "__table__" in info.names:
             return
 
-        table_t = self._sqlalchemy_table_type()
+        table_t = self._sqlalchemy_table_type(ctx.api)
         v = Var("__table__", table_t)
         v.info = info
         v._fullname = f"{info.fullname}.__table__"
@@ -1032,7 +1188,7 @@ class SQLModelMypyPlugin(Plugin):
         sym.plugin_generated = True
         info.names["__table__"] = sym
 
-    def _sqlalchemy_table_type(self) -> Type:
+    def _sqlalchemy_table_type(self, api: Any | None = None) -> Type:
         """Return the best available `sqlalchemy` Table-ish type.
 
         Prefer `sqlalchemy.sql.schema.Table`, but fall back to broader interfaces if the
@@ -1043,15 +1199,19 @@ class SQLModelMypyPlugin(Plugin):
             "sqlalchemy.sql.schema.TableClause",
             "sqlalchemy.sql.selectable.FromClause",
         ):
+            if api is not None:
+                inst = _named_type_or_none(api, fullname)
+                if inst is not None:
+                    return inst
             info = _lookup_typeinfo(self, fullname)
             if info is not None:
                 return Instance(info, [])
-        return AnyType(TypeOfAny.explicit)
+        return _plugin_any()
 
     def _widen_model_config_type(self, ctx: ClassDefContext) -> None:
         mapping_str_any = ctx.api.named_type(
             "typing.Mapping",
-            [ctx.api.named_type("builtins.str"), AnyType(TypeOfAny.explicit)],
+            [ctx.api.named_type("builtins.str"), _plugin_any()],
         )
 
         # Widen the base SQLModel attribute (used as the expected type for overrides).
@@ -1072,6 +1232,15 @@ class SQLModelMypyPlugin(Plugin):
         SQLModel decorates `SQLModelMetaclass` with `__dataclass_transform__`, but we want this plugin
         (not mypy's generic dataclass-transform logic) to generate the model signatures.
         """
+        if not self._plugin_order_ok and not self._reported_plugin_order:
+            self._reported_plugin_order = True
+            ctx.api.fail(
+                "Plugin order matters: list 'sqlmodel_mypy.plugin' before 'pydantic.mypy' "
+                "(see sqlmodel-mypy-plugin README). With 'pydantic.mypy' first, mypy can "
+                "claim SQLModel classes as plain Pydantic models and SQLModel typing becomes incorrect.",
+                ctx.cls,
+                code=ERROR_PLUGIN_ORDER,
+            )
         if self.plugin_config.debug_dataclass_transform:
             return
         info_metaclass = ctx.cls.info.declared_metaclass

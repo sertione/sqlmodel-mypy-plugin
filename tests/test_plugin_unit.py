@@ -1294,6 +1294,131 @@ def test_col_return_type_callback_guard_paths() -> None:
     assert p._sqlmodel_col_return_type_callback(ctx) == default_ret
 
 
+def test_constructor_signature_prefers_plugin_init() -> None:
+    model_info = make_sqlmodel_class("m.User")
+
+    function_type = Instance(make_typeinfo("builtins.function"), [])
+    self_t = Instance(model_info, [])
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+
+    # Simulate the plugin-generated `__init__` signature that mypy stores on the class.
+    init_sig = CallableType(
+        [self_t, int_t],
+        [ARG_POS, ARG_NAMED],
+        ["__sqlmodel_self__", "x"],
+        NoneType(),
+        function_type,
+    )
+    init_var = Var("__init__", init_sig)
+    init_sym = SymbolTableNode(0, init_var)
+    init_sym.plugin_generated = True
+    model_info.names["__init__"] = init_sym
+
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    p.lookup_fully_qualified = lambda full: SimpleNamespace(  # type: ignore[method-assign]
+        node={"m.User": model_info}.get(full)
+    )
+
+    default_sig = CallableType([], [], [], Instance(model_info, []), function_type)
+    hook = p.get_function_signature_hook("m.User")
+    assert hook is not None
+    sig = hook(
+        FunctionSigContext(
+            args=[], default_signature=default_sig, context=NameExpr("x"), api=DummyCheckerAPI()
+        )
+    )
+    assert isinstance(sig, CallableType)
+    assert sig.arg_names == ["x"]
+    assert sig.arg_kinds == [ARG_NAMED]
+    assert sig.ret_type == Instance(model_info, [])
+
+
+def test_declares_sqlmodel_member_uses_metadata() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    info = make_sqlmodel_class("m.User")
+
+    info.metadata[plugin_mod.METADATA_KEY] = {
+        "fields": {"id": {}},
+        "relationships": {"team": {}},
+    }
+
+    assert p._declares_sqlmodel_member(info, "id") is True
+    assert p._declares_sqlmodel_member(info, "team") is True
+    assert p._declares_sqlmodel_member(info, "missing") is False
+
+
+def test_plugins_from_config_file_ini(tmp_path: Path) -> None:
+    path = tmp_path / "mypy.ini"
+    path.write_text(
+        """
+[mypy]
+plugins = pydantic.mypy, sqlmodel_mypy.plugin
+""".lstrip()
+    )
+    assert plugin_mod._plugins_from_config_file(str(path)) == [
+        "pydantic.mypy",
+        "sqlmodel_mypy.plugin",
+    ]
+
+
+def test_plugins_from_config_file_toml_list(tmp_path: Path) -> None:
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        """
+[tool.mypy]
+plugins = ["pydantic.mypy", "sqlmodel_mypy.plugin"]
+""".lstrip()
+    )
+    assert plugin_mod._plugins_from_config_file(str(path)) == [
+        "pydantic.mypy",
+        "sqlmodel_mypy.plugin",
+    ]
+
+
+def test_plugins_from_config_file_toml_string(tmp_path: Path) -> None:
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        """
+[tool.mypy]
+plugins = "pydantic.mypy, sqlmodel_mypy.plugin"
+""".lstrip()
+    )
+    assert plugin_mod._plugins_from_config_file(str(path)) == [
+        "pydantic.mypy",
+        "sqlmodel_mypy.plugin",
+    ]
+
+
+def test_named_type_helpers() -> None:
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+
+    class NamedTypeAPI:
+        def named_type(self, fullname: str, args: list[Type] | None = None) -> Instance:  # noqa: D401
+            return Instance(make_typeinfo(fullname), args or [])
+
+    class NamedGenericTypeAPI:
+        def named_generic_type(self, fullname: str, args: list[Type]) -> Instance:  # noqa: D401
+            return Instance(make_typeinfo(fullname), args)
+
+    t = plugin_mod._named_type_or_none(NamedTypeAPI(), "builtins.int")
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "builtins.int"
+
+    t = plugin_mod._named_type_or_none(NamedGenericTypeAPI(), "builtins.int")
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "builtins.int"
+
+    t = plugin_mod._named_generic_type_or_none(NamedTypeAPI(), "builtins.list", [int_t])
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "builtins.list"
+    assert t.args == (int_t,)
+
+    t = plugin_mod._named_generic_type_or_none(NamedGenericTypeAPI(), "builtins.list", [int_t])
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "builtins.list"
+    assert t.args == (int_t,)
+
+
 def test_get_function_hook_returns_none_for_other_functions() -> None:
     p = plugin_mod.SQLModelMypyPlugin(Options())
     assert p.get_function_hook("sqlmodel.sql.expression.not_col") is None
