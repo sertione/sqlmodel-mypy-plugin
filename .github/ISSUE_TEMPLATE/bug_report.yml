@@ -58,6 +58,6 @@ body:
     attributes:
       label: Versions
       description: Python / mypy / sqlmodel / plugin version (and OS if relevant).
-      placeholder: "Python 3.12.2, mypy 1.19.1, sqlmodel 0.0.31, sqlmodel-mypy 0.3.0"
+      placeholder: "Python 3.12.2, mypy 1.19.1, sqlmodel 0.0.31, sqlmodel-mypy-plugin 0.12.0"
     validations:
       required: true
