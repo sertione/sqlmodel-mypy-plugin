@@ -10,7 +10,7 @@ def main() -> None:
     from sqlmodel_mypy import plugin as plugin_mod
 
     # Ensure wheel metadata is present.
-    _ = metadata.version("sqlmodel-mypy")
+    _ = metadata.version("sqlmodel-mypy-plugin")
 
     # Sanity check plugin entrypoint.
     assert callable(plugin_mod.plugin)
