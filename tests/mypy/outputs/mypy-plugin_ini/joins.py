@@ -30,5 +30,6 @@ with Session(engine) as session:
 
         # Outer join may yield `None` for the right-hand entity.
         bad_team: Team = team2
+# MYPY: error: Incompatible types in assignment (expression has type "Team | None", variable has type "Team")  [assignment]
         if team2 is not None:
             ok_team_name2: str = team2.name

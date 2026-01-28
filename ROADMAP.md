@@ -152,7 +152,7 @@ strict with an “incompatible types in assignment” error (`ConfigDict` vs `SQ
     - `class HeroCreate(SQLModel): model_config = ConfigDict(extra="forbid")`
   - Include a minimal table model + data model inheritance case (common in SQLModel docs) to ensure no false positives.
 
-## v0.10 (`select()` varargs: avoid overload ceiling)
+## v0.10 (`select()` varargs: avoid overload ceiling) - DONE
 
 **Motivation**: SQLModel provides its own typed `select()` overloads, but they are generated only up to **4**
 entities. In real code it’s common to select more than 4 columns/entities (especially with joins/aggregates), which
@@ -177,3 +177,26 @@ can trigger “No overload variant of `select` matches argument types …” eve
 - **Tests**
   - Add a mypy integration module that selects 5+ entities and asserts no `call-overload` errors under strict mode.
   - Decide and lock down the fallback return type (likely `Select[tuple[Any, ...]]`) to keep behavior predictable.
+
+## v0.11 (SQLAlchemy “extras” coverage + SQLModel `Select` join parity) - DONE
+
+- **Lock down common SQLAlchemy helpers used with SQLModel**
+  - `.label(...)` on `table=True` model fields typed as SQLAlchemy expressions.
+  - ORM loader options like `selectinload(Model.relationship)` on `table=True` relationships.
+  - `Select.execution_options(...)` chaining without losing the `Select[...]` generic (including outer-join `None` propagation).
+- **Fix outer-join `None` propagation for SQLModel’s own `Select` wrapper**
+  - Apply the join/outerjoin return-type adjustment to both SQLAlchemy `Select` and SQLModel’s `sqlmodel.sql._expression_select_cls.Select`.
+- **Tests**
+  - Add/extend mypy integration coverage and commit golden outputs for the new cases.
+
+## v0.12 (`__table__` dunder typing + `Session.get`/`AsyncSession.get` coverage) - DONE
+
+**Motivation**: SQLAlchemy APIs and patterns commonly rely on ORM models exposing `Model.__table__`. SQLModel
+models do provide this at runtime for `table=True`, but type checkers can miss it and report `attr-defined`.
+
+- **Expose and type `__table__` on `table=True` SQLModel models**
+  - Provide a plugin-generated `__table__` attribute typed as `sqlalchemy.sql.schema.Table` (with safe fallbacks
+    when stubs don’t expose `Table`).
+- **Tests**
+  - Add mypy integration coverage for `Model.__table__` and `Session.get` / `AsyncSession.get` with SQLModel
+    table models.

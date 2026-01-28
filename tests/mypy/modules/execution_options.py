@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sqlmodel import Field, Session, SQLModel, create_engine, select
+from sqlmodel.sql._expression_select_cls import Select as SQLModelSelect
 
 
 class Team(SQLModel, table=True):
@@ -16,19 +17,16 @@ class Hero(SQLModel, table=True):
 
 engine = create_engine("sqlite://")
 
-with Session(engine) as session:
-    stmt_inner = select(Hero, Team).join(Team)
-    for hero, team in session.exec(stmt_inner):
-        ok_hero: Hero = hero
-        ok_team: Team = team
-        ok_team_name: str = team.name
+stmt = select(Hero, Team).join(Team, isouter=True).execution_options(populate_existing=True)
 
-    stmt_outer = select(Hero, Team).join(Team, isouter=True)
-    for hero2, team2 in session.exec(stmt_outer):
-        ok_hero2: Hero = hero2
-        ok_team2: Team | None = team2
+# `execution_options()` should preserve the `Select[...]` generic, including outer-join `None`
+# propagation for the joined entity.
+ok_stmt: SQLModelSelect[tuple[Hero, Team | None]] = stmt
+
+with Session(engine) as session:
+    for hero, team in session.exec(stmt):
+        ok_hero: Hero = hero
+        ok_team: Team | None = team
 
         # Outer join may yield `None` for the right-hand entity.
-        bad_team: Team = team2
-        if team2 is not None:
-            ok_team_name2: str = team2.name
+        bad_team: Team = team

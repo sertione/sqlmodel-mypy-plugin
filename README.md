@@ -14,6 +14,9 @@ Planned work is tracked in [`ROADMAP.md`](ROADMAP.md).
   - accept common `Field(...)` alias kwargs (`alias` / `validation_alias`) when statically known
 - Improve SQLAlchemy expression typing for **class** attribute access on `table=True` models (e.g. `User.id`,
   `User.name`, `Team.heroes`).
+- Common SQLAlchemy helpers that operate on expressions / selects (e.g. `.label(...)`, `selectinload(...)`,
+  `execution_options(...)`) work without spurious mypy errors.
+- Expose SQLAlchemy table metadata on `table=True` models (e.g. `User.__table__`).
 - Relationship comparator typing on relationship attributes (e.g. `Team.heroes.any(...)`, `Hero.team.has(...)`,
   `Team.heroes.contains(...)`).
 - Outer-join `None` propagation in `select(A, B).join(B, isouter=True)` result tuples.
@@ -95,6 +98,12 @@ class User(SQLModel, table=True):
 stmt = select(User).where(User.name.like("%x%"))
 ```
 
+You can also use SQLAlchemy table metadata attributes without `attr-defined` noise:
+
+```py
+tbl = User.__table__
+```
+
 ### Relationship comparator typing
 
 Relationship attributes declared via `Relationship(...)` are typed as SQLAlchemy expressions at class level,
@@ -105,6 +114,14 @@ stmt = select(Team).where(Team.heroes.any(Hero.name == "x"))
 stmt = select(Hero).where(Hero.team.has(Team.name == "t"))
 stmt = select(Team).where(Team.heroes.contains(hero_obj))
 ```
+
+### Out of scope
+
+- **`column_property(...)` and similar SQLAlchemy helpers**: this plugin doesn’t try to “fix” the *declaration-site*
+  typing for SQLAlchemy-only APIs that aren’t part of SQLModel’s surface area. Prefer SQLAlchemy-typed patterns like
+  `Mapped[...]` / `InstrumentedAttribute[...]` (or local casts/`# type: ignore` if needed).
+- **Pydantic `@computed_field`**: not touched by this plugin (it should type-check via normal property typing / Pydantic
+  typing).
 
 ## Typing strategy (defaults)
 

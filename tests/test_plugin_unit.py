@@ -237,7 +237,9 @@ def test_model_class_callback_invokes_transformer(monkeypatch: pytest.MonkeyPatc
     # Provide the minimal shape expected by the plugin callback.
     p.lookup_fully_qualified = lambda _fullname: None  # type: ignore[method-assign]
     ctx = SimpleNamespace(
-        cls=SimpleNamespace(info=SimpleNamespace(names={})),
+        cls=SimpleNamespace(
+            info=SimpleNamespace(names={}, defn=SimpleNamespace(keywords={}), mro=[])
+        ),
         reason=object(),
         api=SimpleNamespace(named_type=named_type),
     )
@@ -410,6 +412,43 @@ def test_model_construct_signature_hook_includes_relationship_kwargs_for_table_m
     assert isinstance(sig, CallableType)
     assert sig.arg_names[:3] == ["_fields_set", "x", "team"]
     assert sig.arg_kinds[:3] == [ARG_OPT, ARG_NAMED, ARG_NAMED_OPT]
+
+
+def test_select_signature_hook_supports_more_than_4_entities() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    select_info = make_typeinfo("sqlalchemy.sql.selectable.Select")
+    p.lookup_fully_qualified = lambda full: (  # type: ignore[method-assign]
+        SimpleNamespace(node=select_info) if full == "sqlalchemy.sql.selectable.Select" else None
+    )
+
+    default_sig = CallableType(
+        [], [], [], AnyType(TypeOfAny.explicit), Instance(make_typeinfo("builtins.function"), [])
+    )
+
+    call = CallExpr(
+        NameExpr("select"),
+        [NameExpr("a"), NameExpr("b"), NameExpr("c"), NameExpr("d"), NameExpr("e")],
+        [ARG_POS, ARG_POS, ARG_POS, ARG_POS, ARG_POS],
+        [None, None, None, None, None],
+    )
+
+    hook = p.get_function_signature_hook(plugin_mod.SQLMODEL_SELECT_GEN_FULLNAME)
+    assert hook is not None
+
+    api = DummyCheckerAPI()
+    sig = hook(FunctionSigContext(args=[], default_signature=default_sig, context=call, api=api))
+    assert isinstance(sig, CallableType)
+    assert sig.arg_kinds == [ARG_POS, ARG_POS, ARG_POS, ARG_POS, ARG_POS]
+    assert sig.arg_names == ["__ent0", "__ent1", "__ent2", "__ent3", "__ent4"]
+
+    ret = get_proper_type(sig.ret_type)
+    assert isinstance(ret, Instance)
+    assert ret.type.fullname == "sqlalchemy.sql.selectable.Select"
+    assert ret.args
+    row = get_proper_type(ret.args[0])
+    assert isinstance(row, TupleType)
+    assert len(row.items) == 5
 
 
 def test_select_join_isouter_true_makes_joined_entity_optional_in_return_type() -> None:

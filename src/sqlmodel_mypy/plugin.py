@@ -11,7 +11,10 @@ from mypy.nodes import (
     ARG_NAMED,
     ARG_NAMED_OPT,
     ARG_OPT,
+    ARG_POS,
+    ARG_STAR,
     ARG_STAR2,
+    MDEF,
     ArgKind,
     AssignmentStmt,
     Block,
@@ -21,6 +24,7 @@ from mypy.nodes import (
     MemberExpr,
     NameExpr,
     RefExpr,
+    SymbolTableNode,
     TypeInfo,
     Var,
 )
@@ -68,6 +72,13 @@ SQLMODEL_BASEMODEL_FULLNAME = "sqlmodel.main.SQLModel"
 SQLMODEL_METACLASS_FULLNAME = "sqlmodel.main.SQLModelMetaclass"
 
 SQLMODEL_COL_FULLNAME = "sqlmodel.sql.expression.col"
+# SQLModel's `select()` is implemented in a generated module and re-exported.
+SQLMODEL_SELECT_GEN_FULLNAME = "sqlmodel.sql._expression_select_gen.select"
+SQLMODEL_SELECT_FULLNAMES = {
+    SQLMODEL_SELECT_GEN_FULLNAME,
+    "sqlmodel.sql.expression.select",
+    "sqlmodel.select",
+}
 
 SQLALCHEMY_INSTRUMENTED_ATTRIBUTE_FULLNAMES = {
     "sqlalchemy.orm.InstrumentedAttribute",
@@ -79,6 +90,13 @@ SQLALCHEMY_SELECT_JOIN_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.join"
 SQLALCHEMY_SELECT_JOIN_FROM_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.join_from"
 SQLALCHEMY_SELECT_OUTERJOIN_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.outerjoin"
 SQLALCHEMY_SELECT_OUTERJOIN_FROM_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.outerjoin_from"
+
+# SQLModel wraps SQLAlchemy's Select in its own generic Select class.
+SQLMODEL_SELECT_CLS_FULLNAME = "sqlmodel.sql._expression_select_cls.Select"
+SQLMODEL_SELECT_JOIN_FULLNAME = f"{SQLMODEL_SELECT_CLS_FULLNAME}.join"
+SQLMODEL_SELECT_JOIN_FROM_FULLNAME = f"{SQLMODEL_SELECT_CLS_FULLNAME}.join_from"
+SQLMODEL_SELECT_OUTERJOIN_FULLNAME = f"{SQLMODEL_SELECT_CLS_FULLNAME}.outerjoin"
+SQLMODEL_SELECT_OUTERJOIN_FROM_FULLNAME = f"{SQLMODEL_SELECT_CLS_FULLNAME}.outerjoin_from"
 
 # Relationship / comparator methods used in query expressions.
 #
@@ -116,7 +134,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 10
+__version__ = 14
 
 
 class _CollectedField(NamedTuple):
@@ -228,6 +246,8 @@ class SQLModelMypyPlugin(Plugin):
         """Adjust function call signatures (SQLModel constructors and helpers)."""
         if fullname == SQLMODEL_FIELD_FULLNAME:
             return self._sqlmodel_field_signature_callback
+        if fullname in SQLMODEL_SELECT_FULLNAMES:
+            return self._sqlmodel_select_signature_callback
 
         info = _lookup_typeinfo(self, fullname)
         if info is None:
@@ -268,13 +288,16 @@ class SQLModelMypyPlugin(Plugin):
         return None
 
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
-        if fullname == SQLALCHEMY_SELECT_JOIN_FULLNAME:
+        if fullname in {SQLALCHEMY_SELECT_JOIN_FULLNAME, SQLMODEL_SELECT_JOIN_FULLNAME}:
             return self._sqlalchemy_select_join_return_type_callback
-        if fullname == SQLALCHEMY_SELECT_JOIN_FROM_FULLNAME:
+        if fullname in {SQLALCHEMY_SELECT_JOIN_FROM_FULLNAME, SQLMODEL_SELECT_JOIN_FROM_FULLNAME}:
             return self._sqlalchemy_select_join_from_return_type_callback
-        if fullname == SQLALCHEMY_SELECT_OUTERJOIN_FULLNAME:
+        if fullname in {SQLALCHEMY_SELECT_OUTERJOIN_FULLNAME, SQLMODEL_SELECT_OUTERJOIN_FULLNAME}:
             return self._sqlalchemy_select_outerjoin_return_type_callback
-        if fullname == SQLALCHEMY_SELECT_OUTERJOIN_FROM_FULLNAME:
+        if fullname in {
+            SQLALCHEMY_SELECT_OUTERJOIN_FROM_FULLNAME,
+            SQLMODEL_SELECT_OUTERJOIN_FROM_FULLNAME,
+        }:
             return self._sqlalchemy_select_outerjoin_from_return_type_callback
         if (
             fullname in SQLALCHEMY_RELATIONSHIP_COMPARATOR_METHOD_FULLNAMES
@@ -292,7 +315,9 @@ class SQLModelMypyPlugin(Plugin):
         if "." not in fullname:
             return None
         owner_fullname, attr_name = fullname.rsplit(".", 1)
-        if attr_name == "model_config" or attr_name.startswith("_"):
+        if attr_name == "model_config":
+            return None
+        if attr_name.startswith("_") and attr_name != "__table__":
             return None
 
         owner_info = _lookup_typeinfo(self, owner_fullname)
@@ -304,6 +329,9 @@ class SQLModelMypyPlugin(Plugin):
             return None
         if not _is_table_model(owner_info):
             return None
+
+        if attr_name == "__table__":
+            return lambda _ctx: self._sqlalchemy_table_type()
 
         if not self._declares_sqlmodel_member(owner_info, attr_name):
             return None
@@ -589,6 +617,68 @@ class SQLModelMypyPlugin(Plugin):
         new_arg_types[sa_type_index] = UnionType.make_union([old_sa_type, type_engine_instance])
         return default.copy_modified(arg_types=new_arg_types)
 
+    def _sqlmodel_select_signature_callback(self, ctx: FunctionSigContext) -> FunctionLike:
+        """Avoid `select()` overload ceiling by adding a 5+ args fallback.
+
+        SQLModel's generated stubs traditionally cap `select()` overloads at 4 entities.
+        For 5+ entities, fall back to a conservative signature that accepts the call and
+        returns `Select[tuple[Any, ...]]` (represented as a fixed-length tuple of `Any`s).
+        """
+        call = ctx.context
+        if not isinstance(call, CallExpr):
+            return ctx.default_signature
+
+        # Only handle straightforward positional calls; don't change behavior for
+        # `*args` / `**kwargs` forwarding or named arguments.
+        if any(k in {ARG_STAR, ARG_STAR2} for k in call.arg_kinds):
+            return ctx.default_signature
+        if any(name is not None for name in call.arg_names):
+            return ctx.default_signature
+        if any(k != ARG_POS for k in call.arg_kinds):
+            return ctx.default_signature
+
+        positional_count = len(call.arg_kinds)
+        if positional_count <= 4:
+            return ctx.default_signature
+
+        # Idempotency: if upstream stubs already accept 5+ entities (e.g. via a varargs
+        # overload), keep the default signature unchanged.
+        def _callable_supports_n_positional_args(sig: CallableType, n: int) -> bool:
+            kinds = sig.arg_kinds
+            if ARG_STAR in kinds:
+                star_index = kinds.index(ARG_STAR)
+                required = sum(1 for k in kinds[:star_index] if k == ARG_POS)
+                return n >= required
+            if len(kinds) < n:
+                return False
+            return all(k in {ARG_POS, ARG_OPT} for k in kinds[:n])
+
+        try:
+            default_items = ctx.default_signature.items
+        except Exception:
+            return ctx.default_signature
+        if any(
+            isinstance(item, CallableType)
+            and _callable_supports_n_positional_args(item, positional_count)
+            for item in default_items
+        ):
+            return ctx.default_signature
+
+        select_info = _lookup_typeinfo(self, SQLALCHEMY_SELECT_FULLNAME)
+        if select_info is None:
+            return ctx.default_signature
+
+        any_t = AnyType(TypeOfAny.explicit)
+        tuple_fallback = ctx.api.named_generic_type("builtins.tuple", [any_t])
+        row_type = TupleType([any_t] * positional_count, tuple_fallback)
+        ret_type = Instance(select_info, [row_type])
+
+        fallback = default_items[0].fallback if default_items else tuple_fallback
+        arg_types = [any_t] * positional_count
+        arg_kinds: list[ArgKind] = [ARG_POS] * positional_count
+        arg_names = [f"__ent{i}" for i in range(positional_count)]
+        return CallableType(arg_types, arg_kinds, arg_names, ret_type, fallback)
+
     def _sqlmodel_model_construct_signature_callback(self, ctx: MethodSigContext) -> FunctionLike:
         receiver_info: TypeInfo | None = None
         receiver_instance: Instance | None = None
@@ -837,7 +927,10 @@ class SQLModelMypyPlugin(Plugin):
         receiver = get_proper_type(ctx.type)
         if not isinstance(receiver, Instance):
             return ctx.default_return_type
-        if receiver.type.fullname != SQLALCHEMY_SELECT_FULLNAME:
+        if receiver.type.fullname not in {
+            SQLALCHEMY_SELECT_FULLNAME,
+            SQLMODEL_SELECT_CLS_FULLNAME,
+        } and not receiver.type.has_base(SQLALCHEMY_SELECT_FULLNAME):
             return ctx.default_return_type
         if not receiver.args:
             return ctx.default_return_type
@@ -920,6 +1013,40 @@ class SQLModelMypyPlugin(Plugin):
         self._widen_model_config_type(ctx)
         transformer = SQLModelTransformer(ctx.cls, ctx.reason, ctx.api, self.plugin_config)
         transformer.transform()
+        self._add_table_dunders(ctx)
+
+    def _add_table_dunders(self, ctx: ClassDefContext) -> None:
+        info = ctx.cls.info
+        if not _is_table_model(info):
+            return
+
+        if "__table__" in info.names:
+            return
+
+        table_t = self._sqlalchemy_table_type()
+        v = Var("__table__", table_t)
+        v.info = info
+        v._fullname = f"{info.fullname}.__table__"
+        v.is_classvar = True
+        sym = SymbolTableNode(MDEF, v)
+        sym.plugin_generated = True
+        info.names["__table__"] = sym
+
+    def _sqlalchemy_table_type(self) -> Type:
+        """Return the best available `sqlalchemy` Table-ish type.
+
+        Prefer `sqlalchemy.sql.schema.Table`, but fall back to broader interfaces if the
+        installed SQLAlchemy stubs don't expose it.
+        """
+        for fullname in (
+            "sqlalchemy.sql.schema.Table",
+            "sqlalchemy.sql.schema.TableClause",
+            "sqlalchemy.sql.selectable.FromClause",
+        ):
+            info = _lookup_typeinfo(self, fullname)
+            if info is not None:
+                return Instance(info, [])
+        return AnyType(TypeOfAny.explicit)
 
     def _widen_model_config_type(self, ctx: ClassDefContext) -> None:
         mapping_str_any = ctx.api.named_type(
