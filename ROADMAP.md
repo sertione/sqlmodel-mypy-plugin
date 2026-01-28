@@ -91,7 +91,7 @@ errors for documented patterns.
 - **Document trade-offs (and pick a default strategy)**
   - Plugin hooks vs stub overlays vs relying purely on SQLAlchemy typing (with “when to use what” guidance).
 
-## v0.8 (Field `sa_type=` supports SQLAlchemy TypeEngine instances)
+## v0.8 (Field `sa_type=` supports SQLAlchemy TypeEngine instances) - DONE
 
 **Motivation**: SQLModel’s `Field(sa_type=...)` is a supported API, but real-world usage commonly passes
 **instantiated SQLAlchemy types** (e.g. `DateTime(timezone=True)`, `String(50)`), which triggers mypy

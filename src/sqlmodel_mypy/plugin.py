@@ -116,7 +116,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 8
+__version__ = 9
 
 
 class _CollectedField(NamedTuple):
@@ -225,7 +225,10 @@ class SQLModelMypyPlugin(Plugin):
     def get_function_signature_hook(
         self, fullname: str
     ) -> Callable[[FunctionSigContext], FunctionLike] | None:
-        """Make SQLModel constructors correct even if `pydantic.mypy` runs first."""
+        """Adjust function call signatures (SQLModel constructors and helpers)."""
+        if fullname == SQLMODEL_FIELD_FULLNAME:
+            return self._sqlmodel_field_signature_callback
+
         info = _lookup_typeinfo(self, fullname)
         if info is None:
             return None
@@ -539,6 +542,52 @@ class SQLModelMypyPlugin(Plugin):
         ret_type = ctx.default_signature.ret_type
         fallback = ctx.default_signature.fallback
         return CallableType(arg_types, arg_kinds, arg_names, ret_type, fallback)
+
+    def _sqlmodel_field_signature_callback(self, ctx: FunctionSigContext) -> FunctionLike:
+        """Widen `Field(sa_type=...)` to accept TypeEngine instances.
+
+        SQLAlchemy `Column` accepts both a TypeEngine class and a TypeEngine instance (e.g.
+        `DateTime(timezone=True)`, `String(50)`), but SQLModel's stub history has not always
+        reflected that. This hook keeps behavior idempotent when upstream typing is already
+        widened.
+        """
+        default = ctx.default_signature
+        if not isinstance(default, CallableType):
+            return default
+
+        try:
+            sa_type_index = default.arg_names.index("sa_type")
+        except ValueError:
+            return default
+
+        old_sa_type = default.arg_types[sa_type_index]
+        proper_old_sa_type = get_proper_type(old_sa_type)
+        if isinstance(proper_old_sa_type, AnyType):
+            return default
+
+        type_engine_info = _lookup_typeinfo(self, "sqlalchemy.sql.type_api.TypeEngine")
+        if type_engine_info is None:
+            return default
+
+        def _contains_instance_fullname(tp: Type, fullname: str) -> bool:
+            proper = get_proper_type(tp)
+            if isinstance(proper, Instance):
+                return proper.type.fullname == fullname
+            if isinstance(proper, UnionType):
+                return any(_contains_instance_fullname(item, fullname) for item in proper.items)
+            return False
+
+        # Idempotency: if upstream stubs already accept TypeEngine instances, keep unchanged.
+        if _contains_instance_fullname(old_sa_type, type_engine_info.fullname):
+            return default
+
+        any_t = AnyType(TypeOfAny.explicit)
+        type_engine_args = [any_t] * len(type_engine_info.defn.type_vars)
+        type_engine_instance = Instance(type_engine_info, type_engine_args)
+
+        new_arg_types = list(default.arg_types)
+        new_arg_types[sa_type_index] = UnionType.make_union([old_sa_type, type_engine_instance])
+        return default.copy_modified(arg_types=new_arg_types)
 
     def _sqlmodel_model_construct_signature_callback(self, ctx: MethodSigContext) -> FunctionLike:
         receiver_info: TypeInfo | None = None

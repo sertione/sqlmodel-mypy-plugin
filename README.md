@@ -19,6 +19,8 @@ Planned work is tracked in [`ROADMAP.md`](ROADMAP.md).
 - Outer-join `None` propagation in `select(A, B).join(B, isouter=True)` result tuples.
 - Broaden `Session.exec()` / `AsyncSession.exec()` typing to accept SQLAlchemy `Executable` statements (e.g.
   `text(...)`), not just `select(...)`.
+- Accept SQLAlchemy TypeEngine instances in `Field(sa_type=...)` (e.g. `DateTime(timezone=True)`, `String(50)`)
+  without `# type: ignore` in strict mode.
 - Compatible with `pydantic.mypy` in either plugin order.
 
 ## Install (dev)
