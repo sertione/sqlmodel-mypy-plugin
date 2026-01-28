@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlmodel-mypy"
-version = "0.6.0"
+version = "0.7.0"
 description = "Mypy plugin for SQLModel (better constructor/Field typing)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,6 +33,7 @@ dev = [
   "pre-commit",
   "pytest>=8",
   "pytest-cov>=5",
+  "pytest-xdist>=3.8.0",
   "ruff>=0.6",
   "sqlmodel>=0.0.31",
 ]

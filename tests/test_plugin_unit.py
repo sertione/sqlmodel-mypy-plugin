@@ -15,6 +15,7 @@ from mypy.nodes import (
     ClassDef,
     FuncDef,
     IfStmt,
+    MemberExpr,
     NameExpr,
     SymbolTable,
     SymbolTableNode,
@@ -643,6 +644,53 @@ def test_select_outerjoin_makes_target_optional_in_return_type() -> None:
     second = get_proper_type(tp2.items[1])
     assert isinstance(second, UnionType)
     assert any(isinstance(get_proper_type(it), NoneType) for it in second.items)
+
+
+def test_relationship_comparator_hook_coerces_any_return_type_for_sqlmodel_relationship() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    team_info = make_sqlmodel_class("m.Team")
+    team_info.defn.keywords["table"] = NameExpr("True")
+
+    hero_info = make_typeinfo("m.Hero")
+    list_info = make_typeinfo("builtins.list")
+    heroes_t = Instance(list_info, [Instance(hero_info, [])])
+
+    team_info.names["heroes"] = SymbolTableNode(0, Var("heroes", heroes_t))
+    stmt_heroes = plugin_mod.AssignmentStmt(
+        [NameExpr("heroes")], make_call(plugin_mod.SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_heroes.new_syntax = True
+    team_info.defn.defs.body.append(stmt_heroes)
+
+    team_expr = NameExpr("Team")
+    team_expr.node = team_info
+    heroes_expr = MemberExpr(team_expr, "heroes")
+    any_member = MemberExpr(heroes_expr, "any")
+    call = CallExpr(any_member, [], [], [])
+
+    hook = p.get_method_hook("sqlalchemy.orm.base.SQLORMOperations.any")
+    assert hook is not None
+
+    ctx = MethodContext(
+        type=AnyType(TypeOfAny.explicit),
+        arg_types=[],
+        arg_kinds=[],
+        callee_arg_names=[],
+        arg_names=[],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[],
+        context=call,
+        api=DummyCheckerAPI(),
+    )
+    t = hook(ctx)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    assert proper.type.fullname == "sqlalchemy.sql.elements.ColumnElement"
+    assert proper.args
+    arg0 = get_proper_type(proper.args[0])
+    assert isinstance(arg0, Instance)
+    assert arg0.type.fullname == "builtins.bool"
 
 
 def test_constructor_signature_unwraps_mapped_when_typed() -> None:

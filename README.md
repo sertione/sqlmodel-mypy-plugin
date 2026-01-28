@@ -14,6 +14,8 @@ Planned work is tracked in [`ROADMAP.md`](ROADMAP.md).
   - accept common `Field(...)` alias kwargs (`alias` / `validation_alias`) when statically known
 - Improve SQLAlchemy expression typing for **class** attribute access on `table=True` models (e.g. `User.id`,
   `User.name`, `Team.heroes`).
+- Relationship comparator typing on relationship attributes (e.g. `Team.heroes.any(...)`, `Hero.team.has(...)`,
+  `Team.heroes.contains(...)`).
 - Outer-join `None` propagation in `select(A, B).join(B, isouter=True)` result tuples.
 - Broaden `Session.exec()` / `AsyncSession.exec()` typing to accept SQLAlchemy `Executable` statements (e.g.
   `text(...)`), not just `select(...)`.
@@ -89,6 +91,23 @@ class User(SQLModel, table=True):
 
 stmt = select(User).where(User.name.like("%x%"))
 ```
+
+### Relationship comparator typing
+
+Relationship attributes declared via `Relationship(...)` are typed as SQLAlchemy expressions at class level,
+including common relationship comparators used in query filters:
+
+```py
+stmt = select(Team).where(Team.heroes.any(Hero.name == "x"))
+stmt = select(Hero).where(Hero.team.has(Team.name == "t"))
+stmt = select(Team).where(Team.heroes.contains(hero_obj))
+```
+
+## Typing strategy (defaults)
+
+- **Plugin hooks**: SQLModel-specific behavior (constructor signatures, `table=True` expression typing, etc.).
+- **SQLAlchemy typing**: relied upon for core SQL/ORM typing wherever possible.
+- **Stub overlays**: only for upstream gaps that can’t be addressed cleanly via hooks (prefer upstream fixes first).
 
 ## Field aliases in constructor kwargs
 

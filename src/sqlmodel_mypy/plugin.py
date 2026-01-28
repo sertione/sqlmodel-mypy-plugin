@@ -18,6 +18,7 @@ from mypy.nodes import (
     CallExpr,
     Expression,
     IfStmt,
+    MemberExpr,
     NameExpr,
     RefExpr,
     TypeInfo,
@@ -80,11 +81,43 @@ SQLALCHEMY_SELECT_JOIN_FROM_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.join_from"
 SQLALCHEMY_SELECT_OUTERJOIN_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.outerjoin"
 SQLALCHEMY_SELECT_OUTERJOIN_FROM_FULLNAME = f"{SQLALCHEMY_SELECT_FULLNAME}.outerjoin_from"
 
+# Relationship / comparator methods used in query expressions.
+#
+# These are intentionally a small set of best-effort targets; mypy may resolve
+# calls against different bases depending on SQLAlchemy version and stubs.
+SQLALCHEMY_RELATIONSHIP_COMPARATOR_METHOD_FULLNAMES = {
+    # ORM-level helpers (typed on SQLAlchemy's side under TYPE_CHECKING).
+    "sqlalchemy.orm.base.SQLORMOperations.any",
+    "sqlalchemy.orm.base.SQLORMOperations.has",
+    # Comparator base (also typed under TYPE_CHECKING).
+    "sqlalchemy.orm.interfaces.PropComparator.any",
+    "sqlalchemy.orm.interfaces.PropComparator.has",
+    # Instrumented attribute access (mypy may resolve against the concrete type).
+    "sqlalchemy.orm.InstrumentedAttribute.any",
+    "sqlalchemy.orm.InstrumentedAttribute.has",
+    "sqlalchemy.orm.InstrumentedAttribute.contains",
+    "sqlalchemy.orm.attributes.InstrumentedAttribute.any",
+    "sqlalchemy.orm.attributes.InstrumentedAttribute.has",
+    "sqlalchemy.orm.attributes.InstrumentedAttribute.contains",
+    "sqlalchemy.orm.attributes.QueryableAttribute.any",
+    "sqlalchemy.orm.attributes.QueryableAttribute.has",
+    "sqlalchemy.orm.attributes.QueryableAttribute.contains",
+    # Relationship comparator implementation.
+    "sqlalchemy.orm.relationships.RelationshipProperty.Comparator.any",
+    "sqlalchemy.orm.relationships.RelationshipProperty.Comparator.has",
+    "sqlalchemy.orm.relationships.RelationshipProperty.Comparator.contains",
+    # SQLCoreOperations / ColumnOperators surface `.contains(...)` for strings and
+    # relationships; for relationships, SQLAlchemy dispatches to the relationship
+    # comparator at runtime.
+    "sqlalchemy.sql.elements.SQLCoreOperations.contains",
+    "sqlalchemy.sql.operators.ColumnOperators.contains",
+}
+
 SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 7
+__version__ = 8
 
 
 class _CollectedField(NamedTuple):
@@ -241,6 +274,15 @@ class SQLModelMypyPlugin(Plugin):
             return self._sqlalchemy_select_outerjoin_return_type_callback
         if fullname == SQLALCHEMY_SELECT_OUTERJOIN_FROM_FULLNAME:
             return self._sqlalchemy_select_outerjoin_from_return_type_callback
+        if (
+            fullname in SQLALCHEMY_RELATIONSHIP_COMPARATOR_METHOD_FULLNAMES
+            # Robust fallback: different SQLAlchemy/mypy combinations may resolve
+            # these methods against different bases.
+            or fullname.endswith(".any")
+            or fullname.endswith(".has")
+            or fullname.endswith(".contains")
+        ):
+            return self._sqlalchemy_relationship_comparator_return_type_callback
         return None
 
     def get_class_attribute_hook(self, fullname: str) -> Callable[[AttributeContext], Type] | None:
@@ -690,6 +732,60 @@ class SQLModelMypyPlugin(Plugin):
         return self._sqlalchemy_select_join_like_return_type(
             ctx, target_positional_index=1, isouter_always=True
         )
+
+    def _sqlalchemy_relationship_comparator_return_type_callback(self, ctx: MethodContext) -> Type:
+        """Ensure relationship comparator calls return a SQL boolean expression.
+
+        SQLAlchemy's typing for relationship comparator helpers varies across versions and stubs.
+        For SQLModel relationship attributes (declared via `Relationship(...)`), prefer returning
+        `ColumnElement[bool]` when mypy would otherwise fall back to `Any` / `bool`.
+        """
+        call = ctx.context
+        if not isinstance(call, CallExpr):
+            return ctx.default_return_type
+
+        # Identify `Model.relationship.<method>(...)` calls so we only affect SQLModel relationships.
+        callee = call.callee
+        if not isinstance(callee, MemberExpr):
+            return ctx.default_return_type
+
+        receiver = callee.expr
+        if not isinstance(receiver, MemberExpr):
+            return ctx.default_return_type
+
+        rel_name = receiver.name
+        owner_info = _typeinfo_from_ref_expr(receiver.expr)
+        if owner_info is None:
+            return ctx.default_return_type
+        if not owner_info.has_base(SQLMODEL_BASEMODEL_FULLNAME):
+            return ctx.default_return_type
+        if not _is_table_model(owner_info):
+            return ctx.default_return_type
+
+        try:
+            _fields, relationships = self._collect_members_for_signature(owner_info, ctx.api)
+        except Exception:
+            return ctx.default_return_type
+
+        if rel_name not in {r.name for r in relationships}:
+            return ctx.default_return_type
+
+        default = ctx.default_return_type
+        proper_default = get_proper_type(default)
+        if isinstance(proper_default, AnyType):
+            return self._sqlalchemy_column_element_bool_type(ctx)
+        if isinstance(proper_default, Instance) and proper_default.type.fullname == "builtins.bool":
+            return self._sqlalchemy_column_element_bool_type(ctx)
+        return default
+
+    @staticmethod
+    def _sqlalchemy_column_element_bool_type(ctx: MethodContext) -> Type:
+        """Return `sqlalchemy.sql.elements.ColumnElement[bool]` or `Any` as a fallback."""
+        bool_t = ctx.api.named_generic_type("builtins.bool", [])
+        try:
+            return ctx.api.named_generic_type("sqlalchemy.sql.elements.ColumnElement", [bool_t])
+        except Exception:
+            return AnyType(TypeOfAny.explicit)
 
     def _sqlalchemy_select_join_like_return_type(
         self, ctx: MethodContext, *, target_positional_index: int, isouter_always: bool

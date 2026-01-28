@@ -82,7 +82,7 @@ errors for documented patterns.
     - Source: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/ext/asyncio/session.py`
     - Known gap example: `https://github.com/fastapi/sqlmodel/discussions/831`
 
-## v0.7+ (Advanced SQL expression + relationship comparator typing)
+## v0.7 (Advanced SQL expression + relationship comparator typing) - DONE
 
 - **Relationship comparator typing**
   - `.any()`, `.has()`, `.contains()`, etc. on relationship attributes in query expressions.
