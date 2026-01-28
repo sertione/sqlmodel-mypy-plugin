@@ -221,6 +221,10 @@ def test_model_class_callback_invokes_transformer(monkeypatch: pytest.MonkeyPatc
 
     called: dict[str, object] = {}
 
+    def named_type(fullname: str, args: list[object] | None = None) -> object:
+        # Minimal stand-in for SemanticAnalyzerPluginInterface.named_type.
+        return {"fullname": fullname, "args": args or []}
+
     class DummyTransformer:
         def __init__(self, cls: object, reason: object, api: object, plugin_config: object) -> None:
             called["init"] = (cls, reason, api, plugin_config)
@@ -230,7 +234,13 @@ def test_model_class_callback_invokes_transformer(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(plugin_mod, "SQLModelTransformer", DummyTransformer)
 
-    ctx = SimpleNamespace(cls=object(), reason=object(), api=object())
+    # Provide the minimal shape expected by the plugin callback.
+    p.lookup_fully_qualified = lambda _fullname: None  # type: ignore[method-assign]
+    ctx = SimpleNamespace(
+        cls=SimpleNamespace(info=SimpleNamespace(names={})),
+        reason=object(),
+        api=SimpleNamespace(named_type=named_type),
+    )
     p._sqlmodel_model_class_callback(ctx)  # type: ignore[arg-type]
     assert called["transform"] is True
 

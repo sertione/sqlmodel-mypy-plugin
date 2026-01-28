@@ -21,6 +21,7 @@ Planned work is tracked in [`ROADMAP.md`](ROADMAP.md).
   `text(...)`), not just `select(...)`.
 - Accept SQLAlchemy TypeEngine instances in `Field(sa_type=...)` (e.g. `DateTime(timezone=True)`, `String(50)`)
   without `# type: ignore` in strict mode.
+- Accept `model_config = ConfigDict(...)` overrides on SQLModel subclasses in strict mode.
 - Compatible with `pydantic.mypy` in either plugin order.
 
 ## Install (dev)

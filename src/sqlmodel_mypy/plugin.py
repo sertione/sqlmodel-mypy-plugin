@@ -116,7 +116,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 9
+__version__ = 10
 
 
 class _CollectedField(NamedTuple):
@@ -912,8 +912,32 @@ class SQLModelMypyPlugin(Plugin):
         return Instance(mapped_info, [value_type])
 
     def _sqlmodel_model_class_callback(self, ctx: ClassDefContext) -> None:
+        # SQLModel is built on Pydantic v2; users commonly override `model_config`
+        # with `ConfigDict(...)`. SQLModel's own config typing may be narrower
+        # than Pydantic's `ConfigDict` and can trigger strict-mode assignment
+        # errors. Widen to a compatible supertype so `model_config = ConfigDict(...)`
+        # is accepted without `# type: ignore`.
+        self._widen_model_config_type(ctx)
         transformer = SQLModelTransformer(ctx.cls, ctx.reason, ctx.api, self.plugin_config)
         transformer.transform()
+
+    def _widen_model_config_type(self, ctx: ClassDefContext) -> None:
+        mapping_str_any = ctx.api.named_type(
+            "typing.Mapping",
+            [ctx.api.named_type("builtins.str"), AnyType(TypeOfAny.explicit)],
+        )
+
+        # Widen the base SQLModel attribute (used as the expected type for overrides).
+        base_info = _lookup_typeinfo(self, SQLMODEL_BASEMODEL_FULLNAME)
+        if base_info is not None:
+            sym = base_info.names.get("model_config")
+            if sym is not None and isinstance(sym.node, Var):
+                sym.node.type = mapping_str_any
+
+        # Also widen the current class attribute, if declared in this class body.
+        sym = ctx.cls.info.names.get("model_config")
+        if sym is not None and isinstance(sym.node, Var):
+            sym.node.type = mapping_str_any
 
     def _sqlmodel_metaclass_callback(self, ctx: ClassDefContext) -> None:
         """Disable dataclass-transform handling for SQLModel metaclass.

@@ -124,7 +124,7 @@ errors for documented patterns.
   - Ensure the fix is **idempotent**: if upstream SQLModel already accepts instances, our hook/overlay must not
     change behavior or introduce new ambiguities.
 
-## v0.9 (`model_config = ConfigDict(...)` compatibility in strict mode)
+## v0.9 (`model_config = ConfigDict(...)` compatibility in strict mode) - DONE
 
 **Motivation**: SQLModel is built on Pydantic v2, and users often want to set things like `extra="forbid"` on
 schema-like models (e.g. `HeroCreate`, `HeroUpdate`) via `model_config = ConfigDict(...)`. Today this can fail mypy
