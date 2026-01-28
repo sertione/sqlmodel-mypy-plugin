@@ -90,3 +90,90 @@ errors for documented patterns.
   - Multi-entity selects, joins/outer-joins, and relationship-based filters across common SQLModel tutorial patterns.
 - **Document trade-offs (and pick a default strategy)**
   - Plugin hooks vs stub overlays vs relying purely on SQLAlchemy typing (with “when to use what” guidance).
+
+## v0.8 (Field `sa_type=` supports SQLAlchemy TypeEngine instances)
+
+**Motivation**: SQLModel’s `Field(sa_type=...)` is a supported API, but real-world usage commonly passes
+**instantiated SQLAlchemy types** (e.g. `DateTime(timezone=True)`, `String(50)`), which triggers mypy
+`call-overload` errors under `--strict`. Users currently work around this with `sa_column=Column(...)` or
+`# type: ignore`, which is exactly the “types clutter” we want to remove.
+
+- **Fix mypy `call-overload` for `Field(sa_type=<TypeEngine instance>)`**
+  - Upstream issue reports:
+    - `https://github.com/fastapi/sqlmodel/discussions/955`
+    - `https://github.com/fastapi/sqlmodel/discussions/1228`
+  - Upstream pending fix (adjust `sa_type` annotation to match SQLAlchemy’s `Column` type argument rules):
+    - `https://github.com/fastapi/sqlmodel/pull/1345`
+  - Source references:
+    - SQLModel `Field()` signature: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py`
+    - SQLAlchemy `Column` accepts both a **TypeEngine class** and a **TypeEngine instance** (see PR #1345 write-up).
+
+- **Implementation options (pick default; document trade-offs)**
+  - **Preferred**: upstream-first — rely on SQLModel merging PR #1345; in our plugin add a compatibility layer for
+    older SQLModel releases and/or for users stuck on versions without the fix.
+  - **Plugin signature hook**: add a `Field()` signature hook that widens `sa_type` to accept
+    `sqlalchemy.sql.type_api.TypeEngine[Any] | type[Any]` when present.
+  - **Stub overlay**: ship a small `.pyi` overlay (or `typing`-only shim) to widen the `Field()` overload(s) without
+    touching runtime behavior.
+
+- **Tests**
+  - Add a mypy integration module that reproduces the failure in strict mode and asserts it’s fixed without
+    `# type: ignore`, e.g.:
+    - `Field(sa_type=DateTime(timezone=True))`
+    - `Field(sa_type=String(50))`
+  - Ensure the fix is **idempotent**: if upstream SQLModel already accepts instances, our hook/overlay must not
+    change behavior or introduce new ambiguities.
+
+## v0.9 (`model_config = ConfigDict(...)` compatibility in strict mode)
+
+**Motivation**: SQLModel is built on Pydantic v2, and users often want to set things like `extra="forbid"` on
+schema-like models (e.g. `HeroCreate`, `HeroUpdate`) via `model_config = ConfigDict(...)`. Today this can fail mypy
+strict with an “incompatible types in assignment” error (`ConfigDict` vs `SQLModelConfig`), forcing users into
+`# type: ignore` or `cast(...)`.
+
+- **Fix mypy incompatibility for `model_config` overrides**
+  - Upstream discussion / reproduction:
+    - `https://github.com/fastapi/sqlmodel/discussions/855`
+  - Source references:
+    - SQLModel config typing helpers: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/_compat.py`
+    - SQLModel base class `model_config` annotation: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py`
+
+- **Implementation options (pick default; document trade-offs)**
+  - **Stub overlay (likely simplest)**: type `SQLModel.model_config` as `pydantic.ConfigDict` (or `Mapping[str, Any]`)
+    so assignment from `ConfigDict(...)` is always accepted.
+  - **Plugin adjustment**: during semantic analysis, rewrite the inferred type of `model_config` on SQLModel subclasses
+    to a compatible supertype (while keeping runtime untouched).
+  - Ensure we don’t regress table-model behavior: SQLModel uses `model_config["table"]` and `model_config["registry"]`
+    at runtime (see `SQLModelMetaclass.__new__`).
+
+- **Tests**
+  - Add a mypy integration module proving strict-mode acceptance without ignores, e.g.:
+    - `from pydantic import ConfigDict`
+    - `class HeroCreate(SQLModel): model_config = ConfigDict(extra="forbid")`
+  - Include a minimal table model + data model inheritance case (common in SQLModel docs) to ensure no false positives.
+
+## v0.10 (`select()` varargs: avoid overload ceiling)
+
+**Motivation**: SQLModel provides its own typed `select()` overloads, but they are generated only up to **4**
+entities. In real code it’s common to select more than 4 columns/entities (especially with joins/aggregates), which
+can trigger “No overload variant of `select` matches argument types …” even though runtime works.
+
+- **Fix overload ceiling for `sqlmodel.select(...)`**
+  - Source reference (generated overloads; note the 4-entity cap):
+    - `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/sql/_expression_select_gen.py`
+  - Upstream issue reports:
+    - `https://github.com/fastapi/sqlmodel/issues/92`
+    - `https://github.com/fastapi/sqlmodel/issues/271`
+
+- **Implementation options (pick default; document trade-offs)**
+  - **Stub overlay (likely simplest)**: add a final “varargs fallback” overload, e.g.:
+    - `@overload`
+    - `def select(__ent0: Any, __ent1: Any, __ent2: Any, __ent3: Any, __ent4: Any, *entities: Any) -> Select[tuple[Any, ...]]: ...`
+    so mypy always has a matching overload beyond 4 args.
+  - **Plugin signature hook**: provide a mypy hook for `sqlmodel.sql.expression.select` that adds the same fallback
+    overload, keeping the existing 1–4 entity overload precision.
+  - Optionally, generate more precise overloads (e.g. up to 8) if we’re willing to carry the maintenance cost.
+
+- **Tests**
+  - Add a mypy integration module that selects 5+ entities and asserts no `call-overload` errors under strict mode.
+  - Decide and lock down the fallback return type (likely `Select[tuple[Any, ...]]`) to keep behavior predictable.

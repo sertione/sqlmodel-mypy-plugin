@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -55,21 +56,74 @@ def get_expected_return_code(source_code: str) -> int:
     return 1 if re.findall(r"^\s*# MYPY:", source_code, flags=re.MULTILINE) else 0
 
 
-@pytest.mark.parametrize(["config_filename", "python_filename"], cases)
-def test_mypy_results(
-    config_filename: str, python_filename: str, request: pytest.FixtureRequest
-) -> None:
+def group_cases_by_config(cases: list[tuple[str, str]]) -> dict[str, list[str]]:
+    """Convert (config, module) cases to config -> [modules] mapping."""
+    by_config: dict[str, list[str]] = defaultdict(list)
+    for config_filename, python_filename in cases:
+        by_config[config_filename].append(python_filename)
+
+    # Preserve order, avoid duplicates.
+    out: dict[str, list[str]] = {}
+    for config_filename, python_filenames in by_config.items():
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for python_filename in python_filenames:
+            if python_filename in seen:
+                continue
+            seen.add(python_filename)
+            deduped.append(python_filename)
+        out[config_filename] = deduped
+    return out
+
+
+CASES_BY_CONFIG = group_cases_by_config(cases)
+
+
+def normalize_mypy_output_by_file(mypy_out: str) -> dict[Path, str]:
+    """Return mapping of input file path -> normalized mypy stdout for that file.
+
+    Normalized output matches the old behavior: strip the leading file path up to
+    (and including) `.py:`, leaving `line(:col)?: message` lines only.
+    """
+    lines_by_path: dict[Path, list[str]] = defaultdict(list)
+
+    for line in mypy_out.splitlines():
+        if not line:
+            continue
+
+        # Example: /abs/path/to/file.py:24:5: error: ...  [code]
+        match = re.match(r"^(?P<path>.+?\.py):(?P<rest>.*)$", line)
+        if match is None:
+            continue
+
+        path_text = match.group("path")
+        rest = match.group("rest")
+
+        p = Path(path_text)
+        if not p.is_absolute():
+            p = (REPO_ROOT / p).resolve()
+        else:
+            p = p.resolve()
+
+        lines_by_path[p].append(rest)
+
+    return {path: "\n".join(lines).strip() for path, lines in lines_by_path.items()}
+
+
+@pytest.mark.parametrize("config_filename", list(CASES_BY_CONFIG.keys()))
+def test_mypy_results(config_filename: str, request: pytest.FixtureRequest) -> None:
     if mypy_api is None:  # pragma: no cover
         pytest.skip("mypy is not installed")
 
-    input_path = REPO_ROOT / "tests/mypy/modules" / python_filename
     config_path = REPO_ROOT / "tests/mypy/configs" / config_filename
-    output_path = OUTPUTS_DIR / config_path.name.replace(".", "_") / input_path.name
+    output_dir = OUTPUTS_DIR / config_path.name.replace(".", "_")
 
     # Include pid to avoid cross-run incremental cache reuse (keeps coverage stable).
     cache_dir = f".mypy_cache/test-{os.path.splitext(config_filename)[0]}-{os.getpid()}"
-    command = [
-        str(input_path),
+    python_filenames = CASES_BY_CONFIG[config_filename]
+    input_paths = [(REPO_ROOT / "tests/mypy/modules" / fn).resolve() for fn in python_filenames]
+
+    command = [*(str(p) for p in input_paths)] + [
         "--config-file",
         str(config_path),
         "--cache-dir",
@@ -81,31 +135,46 @@ def test_mypy_results(
 
     assert mypy_err == ""
 
-    # Normalize output (strip file paths; avoid OS differences).
-    mypy_out = "\n".join(
-        [".py:".join(line.split(".py:")[1:]) for line in mypy_out.split("\n") if line]
-    ).strip()
-    mypy_out = re.sub(r"\n\s*\n", r"\n", mypy_out)
+    mypy_out_by_file = normalize_mypy_output_by_file(mypy_out)
+    update_mypy = request.config.getoption("update_mypy")
 
-    input_code = input_path.read_text()
-    existing_output_code: str | None = output_path.read_text() if output_path.is_file() else None
+    expected_run_return_code = 0
+    for input_path in input_paths:
+        # Normalize per-file output (avoid OS differences).
+        file_mypy_out = mypy_out_by_file.get(input_path, "")
+        file_mypy_out = re.sub(r"\n\s*\n", r"\n", file_mypy_out).strip()
 
-    merged_output = merge_python_and_mypy_output(input_code, mypy_out)
+        input_code = input_path.read_text()
+        output_path = output_dir / input_path.name
+        existing_output_code: str | None = (
+            output_path.read_text() if output_path.is_file() else None
+        )
+        expected_output = existing_output_code or input_code
 
-    if merged_output == (existing_output_code or input_code):
-        return
+        merged_output = merge_python_and_mypy_output(input_code, file_mypy_out)
 
-    if request.config.getoption("update_mypy"):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(merged_output)
-        return
+        if merged_output != expected_output:
+            if update_mypy:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(merged_output)
+            else:
+                assert existing_output_code is not None, (
+                    f"No output file found for {input_path.name} / {config_filename}. "
+                    "Run: uv run pytest --update-mypy"
+                )
+                assert merged_output == existing_output_code
 
-    assert existing_output_code is not None, (
-        f"No output file found for {python_filename} / {config_filename}. "
-        "Run: uv run pytest --update-mypy"
-    )
-    assert merged_output == existing_output_code
-    assert mypy_returncode == get_expected_return_code(existing_output_code)
+        actual_has_errors = 1 if file_mypy_out else 0
+        expected_has_errors = get_expected_return_code(
+            merged_output if update_mypy else expected_output
+        )
+        assert actual_has_errors == expected_has_errors, (
+            f"Mismatch between golden expectations and mypy output for "
+            f"{input_path.name} / {config_filename}."
+        )
+        expected_run_return_code = max(expected_run_return_code, expected_has_errors)
+
+    assert mypy_returncode == expected_run_return_code
 
 
 def merge_python_and_mypy_output(source_code: str, mypy_output: str) -> str:

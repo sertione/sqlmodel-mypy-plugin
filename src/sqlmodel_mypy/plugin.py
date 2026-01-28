@@ -43,7 +43,6 @@ from mypy.types import (
     FunctionLike,
     Instance,
     NoneType,
-    Overloaded,
     TupleType,
     Type,
     TypeOfAny,
@@ -638,16 +637,13 @@ class SQLModelMypyPlugin(Plugin):
         (e.g. `text(...)`) are only `sqlalchemy.sql.base.Executable`, causing mypy failures.
         """
 
+        # NOTE: mypy applies method signature hooks *per overload item*; when the original
+        # method is `Overloaded`, returning `Overloaded` here will trigger mypy internal errors
+        # (it expects a `CallableType` per item). Keep this hook returning `CallableType`.
         default = ctx.default_signature
-        items: list[CallableType]
-        if isinstance(default, Overloaded):
-            items = list(default.items)
-        elif isinstance(default, CallableType):
-            items = [default]
-        else:
+        if not isinstance(default, CallableType):
             return default
-
-        if not items:
+        if not default.arg_types:
             return default
 
         executable_info = _lookup_typeinfo(self, "sqlalchemy.sql.base.Executable")
@@ -655,59 +651,41 @@ class SQLModelMypyPlugin(Plugin):
             return default
         sqlalchemy_executable = Instance(executable_info, [])
 
-        def _contains_sqlalchemy_executable(tp: Type) -> bool:
-            proper = get_proper_type(tp)
-            if isinstance(proper, Instance):
-                return proper.type.fullname == executable_info.fullname
-            if isinstance(proper, UnionType):
-                return any(_contains_sqlalchemy_executable(item) for item in proper.items)
-            return False
-
-        # Idempotency: if upstream stubs already accept SQLAlchemy Executable, keep them unchanged.
-        for it in items:
-            if it.arg_types and _contains_sqlalchemy_executable(it.arg_types[0]):
-                return default
-
-        any_t = AnyType(TypeOfAny.explicit)
-        try:
-            result_any: Type = ctx.api.named_generic_type(
-                "sqlalchemy.engine.result.Result", [any_t]
-            )
-        except Exception:
-            result_any = any_t
-
-        def _wrap_async_return(ret_template: Type, awaited: Type) -> Type:
-            proper = get_proper_type(ret_template)
-            if isinstance(proper, Instance):
-                fullname = proper.type.fullname
-                if (
-                    fullname in {"typing.Coroutine", "collections.abc.Coroutine"}
-                    and len(proper.args) == 3
-                ):
-                    return Instance(proper.type, [proper.args[0], proper.args[1], awaited])
-                if (
-                    fullname in {"typing.Awaitable", "collections.abc.Awaitable"}
-                    and len(proper.args) == 1
-                ):
-                    return Instance(proper.type, [awaited])
-            try:
-                return ctx.api.named_generic_type("typing.Coroutine", [any_t, any_t, awaited])
-            except Exception:
-                return any_t
-
-        template = items[-1]
-        if not template.arg_types:
+        # Depending on SQLModel/SQLAlchemy versions, the "broad" overload may be expressed via
+        # `sqlmodel.sql.base.Executable[T]` or `sqlalchemy.sql.dml.UpdateBase` (DML statements).
+        sqlmodel_executable_info = _lookup_typeinfo(self, "sqlmodel.sql.base.Executable")
+        update_base_info = _lookup_typeinfo(self, "sqlalchemy.sql.dml.UpdateBase")
+        if sqlmodel_executable_info is None and update_base_info is None:
             return default
 
-        new_arg_types = list(template.arg_types)
-        new_arg_types[0] = sqlalchemy_executable
+        def _contains_instance_fullname(tp: Type, fullname: str) -> bool:
+            proper = get_proper_type(tp)
+            if isinstance(proper, Instance):
+                return proper.type.fullname == fullname
+            if isinstance(proper, UnionType):
+                return any(_contains_instance_fullname(item, fullname) for item in proper.items)
+            return False
 
-        new_ret: Type = result_any
-        if is_async:
-            new_ret = _wrap_async_return(template.ret_type, result_any)
+        # Only adjust the broad overload; keep Select/SelectOfScalar overloads precise.
+        broad = False
+        if sqlmodel_executable_info is not None and _contains_instance_fullname(
+            default.arg_types[0], sqlmodel_executable_info.fullname
+        ):
+            broad = True
+        if update_base_info is not None and _contains_instance_fullname(
+            default.arg_types[0], update_base_info.fullname
+        ):
+            broad = True
+        if not broad:
+            return default
 
-        new_items = items + [template.copy_modified(arg_types=new_arg_types, ret_type=new_ret)]
-        return Overloaded(new_items) if len(new_items) > 1 else new_items[0]
+        # Idempotency: if upstream stubs already accept SQLAlchemy Executable, keep unchanged.
+        if _contains_instance_fullname(default.arg_types[0], executable_info.fullname):
+            return default
+
+        new_arg_types = list(default.arg_types)
+        new_arg_types[0] = UnionType.make_union([default.arg_types[0], sqlalchemy_executable])
+        return default.copy_modified(arg_types=new_arg_types)
 
     def _sqlalchemy_select_join_return_type_callback(self, ctx: MethodContext) -> Type:
         # join(target, onclause=None, *, isouter: bool = False, full: bool = False)
