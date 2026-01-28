@@ -21,19 +21,19 @@ class Hero(SQLModel):
 
 
 Team()
-# MYPY: error: Missing named argument "name" for "Team"  [call-arg]
+# MYPY: error: Missing named argument "name"  [call-arg]
 Team(name="Avengers")
 
 Hero()
-# MYPY: error: Missing named argument "name" for "Hero"  [call-arg]
-# MYPY: error: Missing named argument "secret_name" for "Hero"  [call-arg]
+# MYPY: error: Missing named argument "name"  [call-arg]
+# MYPY: error: Missing named argument "secret_name"  [call-arg]
 Hero(name="Spiderman")
-# MYPY: error: Missing named argument "secret_name" for "Hero"  [call-arg]
+# MYPY: error: Missing named argument "secret_name"  [call-arg]
 Hero(name="Spiderman", secret_name="Peter")
 Hero(name="Spiderman", secret_name="Peter", extra=1)
-# MYPY: error: Unexpected keyword argument "extra" for "Hero"  [call-arg]
+# MYPY: error: Unexpected keyword argument "extra"  [call-arg]
 
 # Type errors only when init_typed=true
 Hero(name=1, secret_name=2)
-# MYPY: error: Argument "name" to "Hero" has incompatible type "int"; expected "str"  [arg-type]
-# MYPY: error: Argument "secret_name" to "Hero" has incompatible type "int"; expected "str"  [arg-type]
+# MYPY: error: Argument "name" has incompatible type "int"; expected "str"  [arg-type]
+# MYPY: error: Argument "secret_name" has incompatible type "int"; expected "str"  [arg-type]

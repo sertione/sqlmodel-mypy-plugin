@@ -4,12 +4,32 @@ Mypy plugin that improves type checking for [`SQLModel`](https://github.com/fast
 
 ## Status
 
-Early/experimental. The first milestone is **correct required/optional kwargs** for fields declared via
-`sqlmodel.Field(...)` and **ignoring** `sqlmodel.Relationship(...)` in generated constructor signatures.
+Early/experimental. Implemented scope (supported today):
+
+Planned work is tracked in [`ROADMAP.md`](ROADMAP.md).
+
+- Generate correct `__init__` / `model_construct` signatures for SQLModel models:
+  - treat `sqlmodel.Field(...)` required/optional correctly
+  - accept `sqlmodel.Relationship(...)` kwargs for `table=True` models
+  - accept common `Field(...)` alias kwargs (`alias` / `validation_alias`) when statically known
+- Improve SQLAlchemy expression typing for **class** attribute access on `table=True` models (e.g. `User.id`,
+  `User.name`, `Team.heroes`).
+- Common SQLAlchemy helpers that operate on expressions / selects (e.g. `.label(...)`, `selectinload(...)`,
+  `execution_options(...)`) work without spurious mypy errors.
+- Expose SQLAlchemy table metadata on `table=True` models (e.g. `User.__table__`).
+- Relationship comparator typing on relationship attributes (e.g. `Team.heroes.any(...)`, `Hero.team.has(...)`,
+  `Team.heroes.contains(...)`).
+- Outer-join `None` propagation in `select(A, B).join(B, isouter=True)` result tuples.
+- Broaden `Session.exec()` / `AsyncSession.exec()` typing to accept SQLAlchemy `Executable` statements (e.g.
+  `text(...)`), not just `select(...)`.
+- Accept SQLAlchemy TypeEngine instances in `Field(sa_type=...)` (e.g. `DateTime(timezone=True)`, `String(50)`)
+  without `# type: ignore` in strict mode.
+- Accept `model_config = ConfigDict(...)` overrides on SQLModel subclasses in strict mode.
+- Compatible with `pydantic.mypy` in either plugin order.
 
 ## Install (dev)
 
-Prereqs: **Python \u2265 3.10** and [`uv`](https://docs.astral.sh/uv/).
+Prereqs: **Python 3.10+** and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
 make install
@@ -30,11 +50,13 @@ make check
 plugins = sqlmodel_mypy.plugin
 ```
 
-If you also use `pydantic.mypy`, list this plugin **first** so it can take over SQLModel classes:
+If you also use `pydantic.mypy`, you can list plugins in either order:
 
 ```ini
 [mypy]
 plugins = sqlmodel_mypy.plugin, pydantic.mypy
+# or:
+# plugins = pydantic.mypy, sqlmodel_mypy.plugin
 ```
 
 ## Plugin configuration
@@ -60,6 +82,65 @@ warn_untyped_fields = true
 ## Error codes
 
 - `sqlmodel-field`: field-related plugin errors (e.g. untyped `x = Field(...)`).
+
+## SQL expression typing
+
+This plugin adjusts **class attribute** types on `table=True` SQLModel models to behave like SQLAlchemy
+expressions, so you can write queries without `col()`:
+
+```py
+from sqlmodel import Field, SQLModel, select
+
+class User(SQLModel, table=True):
+    id: int = Field(primary_key=True)
+    name: str = Field()
+
+stmt = select(User).where(User.name.like("%x%"))
+```
+
+You can also use SQLAlchemy table metadata attributes without `attr-defined` noise:
+
+```py
+tbl = User.__table__
+```
+
+### Relationship comparator typing
+
+Relationship attributes declared via `Relationship(...)` are typed as SQLAlchemy expressions at class level,
+including common relationship comparators used in query filters:
+
+```py
+stmt = select(Team).where(Team.heroes.any(Hero.name == "x"))
+stmt = select(Hero).where(Hero.team.has(Team.name == "t"))
+stmt = select(Team).where(Team.heroes.contains(hero_obj))
+```
+
+### Out of scope
+
+- **`column_property(...)` and similar SQLAlchemy helpers**: this plugin doesn’t try to “fix” the *declaration-site*
+  typing for SQLAlchemy-only APIs that aren’t part of SQLModel’s surface area. Prefer SQLAlchemy-typed patterns like
+  `Mapped[...]` / `InstrumentedAttribute[...]` (or local casts/`# type: ignore` if needed).
+- **Pydantic `@computed_field`**: not touched by this plugin (it should type-check via normal property typing / Pydantic
+  typing).
+
+## Typing strategy (defaults)
+
+- **Plugin hooks**: SQLModel-specific behavior (constructor signatures, `table=True` expression typing, etc.).
+- **SQLAlchemy typing**: relied upon for core SQL/ORM typing wherever possible.
+- **Stub overlays**: only for upstream gaps that can’t be addressed cleanly via hooks (prefer upstream fixes first).
+
+## Field aliases in constructor kwargs
+
+If you use `Field(alias=...)` (or `validation_alias=...` / `schema_extra={"validation_alias": ...}`), the plugin
+adds the alias name as an accepted keyword argument in generated `__init__` / `model_construct` signatures.
+This avoids false-positive “unexpected keyword argument” errors when `init_forbid_extra=true`.
+
+Limitations:
+
+- Only **string-literal** aliases are recognized (e.g. `Field(alias=\"full_name\")`).
+- Aliases that are not valid Python identifiers (or that collide with other parameter names) are ignored.
+- Mypy can’t express “either field name or alias is required”, so aliased required fields may not be reported as
+  missing at type-check time.
 
 ## Development
 

@@ -21,14 +21,14 @@ class Hero(SQLModel):
 
 
 Team()
-# MYPY: error: Missing named argument "name" for "Team"  [call-arg]
+# MYPY: error: Missing named argument "name"  [call-arg]
 Team(name="Avengers")
 
 Hero()
-# MYPY: error: Missing named argument "name" for "Hero"  [call-arg]
-# MYPY: error: Missing named argument "secret_name" for "Hero"  [call-arg]
+# MYPY: error: Missing named argument "name"  [call-arg]
+# MYPY: error: Missing named argument "secret_name"  [call-arg]
 Hero(name="Spiderman")
-# MYPY: error: Missing named argument "secret_name" for "Hero"  [call-arg]
+# MYPY: error: Missing named argument "secret_name"  [call-arg]
 Hero(name="Spiderman", secret_name="Peter")
 Hero(name="Spiderman", secret_name="Peter", extra=1)
 

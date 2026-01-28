@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from mypy.nodes import (
     ARG_NAMED,
+    ARG_NAMED_OPT,
     ARG_POS,
     INVARIANT,
     MDEF,
@@ -13,11 +14,13 @@ from mypy.nodes import (
     CallExpr,
     ClassDef,
     Decorator,
+    DictExpr,
     EllipsisExpr,
     FuncDef,
     IfStmt,
     NameExpr,
     PlaceholderNode,
+    StrExpr,
     SymbolTable,
     SymbolTableNode,
     TempNode,
@@ -34,6 +37,7 @@ from sqlmodel_mypy.transform import (
     SQLMODEL_RELATIONSHIP_FULLNAME,
     ForceInvariantTypeVars,
     SQLModelField,
+    SQLModelRelationship,
     SQLModelTransformer,
     _callee_fullname,
     add_method,
@@ -191,8 +195,147 @@ def test_get_has_default_covers_common_cases() -> None:
     stmt.new_syntax = True
     assert transformer.get_has_default(stmt) is False
 
+    # x: int = 1 -> optional
+    stmt = AssignmentStmt([NameExpr("x")], NameExpr("y"))
+    stmt.new_syntax = True
+    assert transformer.get_has_default(stmt) is True
 
-def test_collect_field_from_stmt_untyped_warns() -> None:
+
+def test_get_field_aliases_covers_common_cases() -> None:
+    # alias=...
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("full_name")],
+            arg_names=["alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == ["full_name"]
+
+    # alias + validation_alias override
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("a"), StrExpr("va")],
+            arg_names=["alias", "validation_alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == ["a", "va"]
+
+    # schema_extra validation alias
+    schema_extra = DictExpr([(StrExpr("validation_alias"), StrExpr("sa"))])
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("a"), schema_extra],
+            arg_names=["alias", "schema_extra"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == ["a", "sa"]
+
+    # Ignore invalid keyword names.
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("full-name")],
+            arg_names=["alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # Ignore non-literal values.
+    dyn = NameExpr("ALIAS")
+    dyn.fullname = "m.ALIAS"
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[dyn],
+            arg_names=["alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # Non-Field calls -> no aliases.
+    stmt = AssignmentStmt([NameExpr("x")], NameExpr("y"))
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # Explicit alias=None -> treated as absent.
+    none_expr = NameExpr("None")
+    none_expr.fullname = "builtins.None"
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[none_expr],
+            arg_names=["alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # serialization_alias is parsed (but is not a constructor kwarg).
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("ser")],
+            arg_names=["serialization_alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # schema_extra serialization alias is also parsed (but is not a constructor kwarg).
+    schema_extra = DictExpr([(StrExpr("serialization_alias"), StrExpr("ser"))])
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[schema_extra],
+            arg_names=["schema_extra"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # Ignore schema_extra keys that are not string literals.
+    schema_extra = DictExpr([(NameExpr("validation_alias"), StrExpr("sa"))])
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[schema_extra],
+            arg_names=["schema_extra"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+    # Ignore Python keywords as argument names.
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[StrExpr("class")],
+            arg_names=["alias"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+
+def test_collect_member_from_stmt_untyped_warns() -> None:
     cls = make_sqlmodel_class()
     api = DummyAPI()
     plugin_config = SimpleNamespace(
@@ -203,7 +346,7 @@ def test_collect_field_from_stmt_untyped_warns() -> None:
     # x = Field(...)
     stmt = AssignmentStmt([NameExpr("x")], make_field_call(fullname=SQLMODEL_FIELD_FULLNAME))
     stmt.new_syntax = False
-    assert transformer.collect_field_from_stmt(stmt) is None
+    assert transformer.collect_member_from_stmt(stmt) is None
     assert ("Untyped fields disallowed", ERROR_FIELD) in api.failed
 
     # Relationship() is also disallowed when untyped
@@ -212,11 +355,11 @@ def test_collect_field_from_stmt_untyped_warns() -> None:
         [NameExpr("rel")], make_field_call(fullname=SQLMODEL_RELATIONSHIP_FULLNAME)
     )
     stmt.new_syntax = False
-    assert transformer.collect_field_from_stmt(stmt) is None
+    assert transformer.collect_member_from_stmt(stmt) is None
     assert ("Untyped fields disallowed", ERROR_FIELD) in api.failed
 
 
-def test_collect_field_from_stmt_typed_collects_and_skips() -> None:
+def test_collect_member_from_stmt_typed_collects_and_skips() -> None:
     cls = make_sqlmodel_class()
     api = DummyAPI()
     plugin_config = SimpleNamespace(
@@ -229,18 +372,20 @@ def test_collect_field_from_stmt_typed_collects_and_skips() -> None:
         [NameExpr("model_config")], make_field_call(fullname=SQLMODEL_FIELD_FULLNAME)
     )
     stmt.new_syntax = True
-    assert transformer.collect_field_from_stmt(stmt) is None
+    assert transformer.collect_member_from_stmt(stmt) is None
 
     stmt = AssignmentStmt([NameExpr("_hidden")], make_field_call(fullname=SQLMODEL_FIELD_FULLNAME))
     stmt.new_syntax = True
-    assert transformer.collect_field_from_stmt(stmt) is None
+    assert transformer.collect_member_from_stmt(stmt) is None
 
-    # Relationships are ignored
+    # Relationships are tracked (but excluded from constructor args)
     stmt = AssignmentStmt(
         [NameExpr("team")], make_field_call(fullname=SQLMODEL_RELATIONSHIP_FULLNAME)
     )
     stmt.new_syntax = True
-    assert transformer.collect_field_from_stmt(stmt) is None
+    rel = transformer.collect_member_from_stmt(stmt)
+    assert isinstance(rel, SQLModelRelationship)
+    assert rel.name == "team"
 
     # Non-NameExpr lvalues are ignored
     stmt = AssignmentStmt(
@@ -248,7 +393,7 @@ def test_collect_field_from_stmt_typed_collects_and_skips() -> None:
         make_field_call(fullname=SQLMODEL_FIELD_FULLNAME),
     )
     stmt.new_syntax = True
-    assert transformer.collect_field_from_stmt(stmt) is None
+    assert transformer.collect_member_from_stmt(stmt) is None
 
     # A proper typed field is collected
     any_t = AnyType(TypeOfAny.explicit)
@@ -256,8 +401,9 @@ def test_collect_field_from_stmt_typed_collects_and_skips() -> None:
     cls.info.names["x"] = SymbolTableNode(MDEF, var)
     stmt = AssignmentStmt([NameExpr("x")], make_field_call(fullname=SQLMODEL_FIELD_FULLNAME))
     stmt.new_syntax = True
-    field = transformer.collect_field_from_stmt(stmt)
+    field = transformer.collect_member_from_stmt(stmt)
     assert field is not None
+    assert isinstance(field, SQLModelField)
     assert field.name == "x"
     assert field.type is any_t
 
@@ -267,19 +413,19 @@ def test_collect_field_from_stmt_typed_collects_and_skips() -> None:
     cls.info.names["y"] = SymbolTableNode(MDEF, var2)
     stmt = AssignmentStmt([NameExpr("y")], make_field_call(fullname=SQLMODEL_FIELD_FULLNAME))
     stmt.new_syntax = True
-    assert transformer.collect_field_from_stmt(stmt) is None
+    assert transformer.collect_member_from_stmt(stmt) is None
 
     # PlaceholderNode and TypeAlias nodes are ignored
     cls.info.names["p"] = SymbolTableNode(MDEF, PlaceholderNode("m.p", NameExpr("p"), 1))
     stmt = AssignmentStmt([NameExpr("p")], make_field_call(fullname=SQLMODEL_FIELD_FULLNAME))
     stmt.new_syntax = True
-    assert transformer.collect_field_from_stmt(stmt) is None
+    assert transformer.collect_member_from_stmt(stmt) is None
 
     alias = TypeAlias(AnyType(TypeOfAny.explicit), "m.alias", "m", 1, 0)
     cls.info.names["alias"] = SymbolTableNode(MDEF, alias)
     stmt = AssignmentStmt([NameExpr("alias")], make_field_call(fullname=SQLMODEL_FIELD_FULLNAME))
     stmt.new_syntax = True
-    assert transformer.collect_field_from_stmt(stmt) is None
+    assert transformer.collect_member_from_stmt(stmt) is None
 
 
 def test_add_method_generates_and_replaces_methods() -> None:
@@ -323,7 +469,9 @@ def test_transform_defer_paths() -> None:
     )
 
     class DeferTransformer(SQLModelTransformer):
-        def collect_fields(self) -> list[SQLModelField] | None:  # noqa: D401
+        def collect_members(  # noqa: D401
+            self,
+        ) -> tuple[list[SQLModelField], dict[str, SQLModelRelationship]] | None:
             return None
 
     t = DeferTransformer(cls, cls, api, plugin_config)
@@ -333,9 +481,10 @@ def test_transform_defer_paths() -> None:
     # If any field has no type, we defer as well.
     api = DummyAPI()
     t2 = SQLModelTransformer(cls, cls, api, plugin_config)
-    t2.collect_fields = lambda: [
-        SQLModelField(name="x", has_default=False, line=1, column=0, type=None, info=cls.info)
-    ]  # type: ignore[method-assign]
+    t2.collect_members = lambda: (  # type: ignore[method-assign]
+        [SQLModelField(name="x", has_default=False, line=1, column=0, type=None, info=cls.info)],
+        {},
+    )
     assert t2.transform() is False
     assert api.deferred is True
 
@@ -353,7 +502,7 @@ def test_transform_generates_init_and_model_construct_and_metadata() -> None:
         SQLModelField(name="a", has_default=False, line=1, column=0, type=any_t, info=cls.info),
         SQLModelField(name="b", has_default=True, line=1, column=0, type=any_t, info=cls.info),
     ]
-    transformer.collect_fields = lambda: fields  # type: ignore[method-assign]
+    transformer.collect_members = lambda: (fields, {})  # type: ignore[method-assign]
     assert transformer.transform() is True
 
     # Plugin-generated methods are registered.
@@ -363,6 +512,238 @@ def test_transform_generates_init_and_model_construct_and_metadata() -> None:
     # Metadata is JSON-serializable.
     assert METADATA_KEY in cls.info.metadata
     assert set(cls.info.metadata[METADATA_KEY]["fields"].keys()) == {"a", "b"}
+    assert cls.info.metadata[METADATA_KEY]["relationships"] == {}
+
+
+def test_transform_adds_field_alias_kwargs_to_signatures_and_metadata() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+    plugin_config = SimpleNamespace(
+        init_typed=True, init_forbid_extra=True, warn_untyped_fields=True
+    )
+    transformer = SQLModelTransformer(cls, cls, api, plugin_config)
+
+    any_t = AnyType(TypeOfAny.explicit)
+    fields = [
+        SQLModelField(
+            name="name",
+            has_default=False,
+            line=1,
+            column=0,
+            aliases=["full_name"],
+            type=any_t,
+            info=cls.info,
+        )
+    ]
+    transformer.collect_members = lambda: (fields, {})  # type: ignore[method-assign]
+    assert transformer.transform() is True
+
+    init_node = cls.info.names["__init__"].node
+    assert isinstance(init_node, FuncDef)
+    init_args = {a.variable.name: a for a in init_node.arguments}
+    assert "name" in init_args
+    assert "full_name" in init_args
+    assert init_args["name"].kind == ARG_NAMED_OPT
+    assert init_args["full_name"].kind == ARG_NAMED_OPT
+
+    mc_node = cls.info.names["model_construct"].node
+    assert isinstance(mc_node, Decorator)
+    assert isinstance(mc_node.func, FuncDef)
+    mc_args = {a.variable.name: a for a in mc_node.func.arguments}
+    assert "_fields_set" in mc_args
+    assert "name" in mc_args
+    assert "full_name" in mc_args
+    assert mc_args["name"].kind == ARG_NAMED_OPT
+    assert mc_args["full_name"].kind == ARG_NAMED_OPT
+
+    meta = cls.info.metadata[METADATA_KEY]
+    assert meta["fields"]["name"]["aliases"] == ["full_name"]
+
+
+def test_transform_table_model_includes_relationship_kwargs_and_types() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+    plugin_config = SimpleNamespace(
+        init_typed=True, init_forbid_extra=True, warn_untyped_fields=True
+    )
+    transformer = SQLModelTransformer(cls, cls, api, plugin_config)
+
+    # Treat this class as `table=True`.
+    cls.info.defn.keywords["table"] = NameExpr("True")
+
+    # Required field.
+    any_t = AnyType(TypeOfAny.explicit)
+    name_var = Var("name", any_t)
+    cls.info.names["name"] = SymbolTableNode(MDEF, name_var)
+    stmt_name = AssignmentStmt(
+        [NameExpr("name")], make_field_call(fullname=SQLMODEL_FIELD_FULLNAME)
+    )
+    stmt_name.new_syntax = True
+
+    # Typed relationship.
+    team_info = make_typeinfo("m.Team")
+    team_t = Instance(team_info, [])
+    team_var = Var("team", team_t)
+    cls.info.names["team"] = SymbolTableNode(MDEF, team_var)
+    stmt_team = AssignmentStmt(
+        [NameExpr("team")], make_field_call(fullname=SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_team.new_syntax = True
+
+    # Relationship with missing type -> falls back to Any.
+    zzz_var = Var("zzz", None)
+    cls.info.names["zzz"] = SymbolTableNode(MDEF, zzz_var)
+    stmt_zzz = AssignmentStmt(
+        [NameExpr("zzz")], make_field_call(fullname=SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_zzz.new_syntax = True
+
+    cls.defs.body.extend([stmt_name, stmt_team, stmt_zzz])
+    assert transformer.transform() is True
+
+    meta = cls.info.metadata[METADATA_KEY]
+    assert set(meta["relationships"].keys()) == {"team", "zzz"}
+
+    init_node = cls.info.names["__init__"].node
+    assert isinstance(init_node, FuncDef)
+    init_arg_names = [a.variable.name for a in init_node.arguments]
+    assert "kwargs" not in init_arg_names
+    assert "team" in init_arg_names
+    assert "zzz" in init_arg_names
+
+    team_arg = next(a for a in init_node.arguments if a.variable.name == "team")
+    assert team_arg.kind == ARG_NAMED_OPT
+    assert team_arg.type_annotation == team_t
+
+    zzz_arg = next(a for a in init_node.arguments if a.variable.name == "zzz")
+    assert isinstance(zzz_arg.type_annotation, AnyType)
+
+    mc_node = cls.info.names["model_construct"].node
+    assert isinstance(mc_node, Decorator)
+    assert isinstance(mc_node.func, FuncDef)
+    mc_arg_names = [a.variable.name for a in mc_node.func.arguments]
+    assert "kwargs" not in mc_arg_names
+    assert "team" in mc_arg_names
+    assert "zzz" in mc_arg_names
+
+
+def test_transform_non_table_model_does_not_accept_relationship_kwargs() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+    plugin_config = SimpleNamespace(
+        init_typed=True, init_forbid_extra=True, warn_untyped_fields=True
+    )
+    transformer = SQLModelTransformer(cls, cls, api, plugin_config)
+
+    # Add SQLModel base to the MRO so `_is_table_model()` exercises the base-skip path.
+    sqlmodel_info = make_typeinfo("sqlmodel.main.SQLModel")
+    obj_info = sqlmodel_info.mro[-1]
+    cls.info.mro = [cls.info, sqlmodel_info, obj_info]
+
+    any_t = AnyType(TypeOfAny.explicit)
+    name_var = Var("name", any_t)
+    cls.info.names["name"] = SymbolTableNode(MDEF, name_var)
+    stmt_name = AssignmentStmt(
+        [NameExpr("name")], make_field_call(fullname=SQLMODEL_FIELD_FULLNAME)
+    )
+    stmt_name.new_syntax = True
+
+    team_info = make_typeinfo("m.Team")
+    team_t = Instance(team_info, [])
+    team_var = Var("team", team_t)
+    cls.info.names["team"] = SymbolTableNode(MDEF, team_var)
+    stmt_team = AssignmentStmt(
+        [NameExpr("team")], make_field_call(fullname=SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_team.new_syntax = True
+
+    cls.defs.body.extend([stmt_name, stmt_team])
+    assert transformer.transform() is True
+
+    # Relationship is recorded, but not accepted in signatures for non-table models.
+    meta = cls.info.metadata[METADATA_KEY]
+    assert set(meta["relationships"].keys()) == {"team"}
+
+    init_node = cls.info.names["__init__"].node
+    assert isinstance(init_node, FuncDef)
+    init_arg_names = [a.variable.name for a in init_node.arguments]
+    assert "team" not in init_arg_names
+
+    mc_node = cls.info.names["model_construct"].node
+    assert isinstance(mc_node, Decorator)
+    assert isinstance(mc_node.func, FuncDef)
+    mc_arg_names = [a.variable.name for a in mc_node.func.arguments]
+    assert "team" not in mc_arg_names
+
+
+def test_transform_inherits_relationships_from_old_metadata_list_format() -> None:
+    api = DummyAPI()
+    plugin_config = SimpleNamespace(
+        init_typed=True, init_forbid_extra=True, warn_untyped_fields=True
+    )
+
+    sqlmodel_info = make_typeinfo("sqlmodel.main.SQLModel")
+    obj_info = sqlmodel_info.mro[-1]
+
+    base_info = make_typeinfo("m.Base")
+    base_info.mro = [base_info, sqlmodel_info, obj_info]
+    base_info.metadata[METADATA_KEY] = {"fields": {}, "relationships": ["team"]}
+
+    derived_cls = make_sqlmodel_class("m.User")
+    derived_cls.info.mro = [derived_cls.info, base_info, sqlmodel_info, obj_info]
+    derived_cls.info.defn.keywords["table"] = NameExpr("True")
+
+    transformer = SQLModelTransformer(derived_cls, derived_cls, api, plugin_config)
+    assert transformer.transform() is True
+
+    init_node = derived_cls.info.names["__init__"].node
+    assert isinstance(init_node, FuncDef)
+    team_arg = next(a for a in init_node.arguments if a.variable.name == "team")
+    assert isinstance(team_arg.type_annotation, AnyType)
+
+
+def test_transform_defers_when_base_sqlmodel_subclass_not_processed() -> None:
+    api = DummyAPI()
+    plugin_config = SimpleNamespace(
+        init_typed=True, init_forbid_extra=False, warn_untyped_fields=True
+    )
+
+    sqlmodel_info = make_typeinfo("sqlmodel.main.SQLModel")
+    obj_info = sqlmodel_info.mro[-1]
+
+    base_info = make_typeinfo("m.Base")
+    base_info.mro = [base_info, sqlmodel_info, obj_info]
+    # No METADATA_KEY on base_info.metadata -> should force deferral for SQLModel subclasses.
+
+    derived_cls = make_sqlmodel_class("m.User")
+    derived_cls.info.mro = [derived_cls.info, base_info, sqlmodel_info, obj_info]
+
+    transformer = SQLModelTransformer(derived_cls, derived_cls, api, plugin_config)
+    assert transformer.transform() is False
+    assert api.deferred is True
+
+
+def test_relationship_expand_type_self_type_branch() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+
+    self_tv = TypeVarType(
+        "SelfT",
+        "SelfT",
+        TypeVarId(1),
+        [],
+        AnyType(TypeOfAny.explicit),
+        AnyType(TypeOfAny.explicit),
+        INVARIANT,
+    )
+    cls.info.self_type = self_tv  # type: ignore[attr-defined]
+
+    rel = SQLModelRelationship(name="rel", line=1, column=0)
+    rel.type = self_tv
+    rel.info = cls.info
+
+    expanded = rel.expand_type(cls.info, api, force_typevars_invariant=True)
+    assert isinstance(expanded, Instance)
 
 
 def test_field_expand_type_self_type_branch_and_invariant_translation() -> None:
@@ -407,6 +788,62 @@ def test_field_expand_type_self_type_branch_and_invariant_translation() -> None:
     assert isinstance(tv2, TypeVarType)
     assert tv2.variance == INVARIANT
 
+    # Invariant vars are returned unchanged.
+    tv_inv = TypeVarType(
+        "TInv",
+        "TInv",
+        TypeVarId(3),
+        [],
+        AnyType(TypeOfAny.explicit),
+        AnyType(TypeOfAny.explicit),
+        INVARIANT,
+    )
+    tv_inv2 = tv_inv.accept(ForceInvariantTypeVars())
+    assert tv_inv2 is tv_inv
+
+
+def test_field_expand_type_returns_none_when_missing_type() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+
+    field = SQLModelField(
+        name="x",
+        has_default=False,
+        line=1,
+        column=0,
+        type=None,
+        info=cls.info,
+    )
+    assert field.expand_type(cls.info, api) is None
+    field.expand_typevar_from_subtype(cls.info, api)
+
+
+def test_sqlmodelfield_deserialize_dedupes_aliases() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+
+    any_t = AnyType(TypeOfAny.explicit)
+    field = SQLModelField(
+        name="x",
+        has_default=False,
+        line=1,
+        column=0,
+        aliases=["a"],
+        type=any_t,
+        info=cls.info,
+    )
+    data = field.serialize()
+    data["aliases"] = ["a", "a", 1]  # type: ignore[assignment]
+
+    # `deserialize_and_fixup_type()` expects a real mypy `SemanticAnalyzerPluginInterface`
+    # instance; patch it for this unit test so we can exercise the alias handling.
+    from unittest.mock import patch
+
+    with patch("sqlmodel_mypy.transform.deserialize_and_fixup_type", return_value=any_t):
+        field2 = SQLModelField.deserialize(cls.info, data, api)  # type: ignore[arg-type]
+    assert field2.aliases == ["a"]
+    assert isinstance(field2.type, AnyType)
+
 
 def test_collect_fields_includes_if_blocks_and_inherited_metadata() -> None:
     # Build a base class with serialized metadata and a derived class that inherits it.
@@ -440,17 +877,19 @@ def test_collect_fields_includes_if_blocks_and_inherited_metadata() -> None:
     derived_cls.defs.body.append(if_stmt)
 
     transformer = SQLModelTransformer(derived_cls, derived_cls, api, plugin_config)
-    fields = transformer.collect_fields()
-    assert fields is not None
+    members = transformer.collect_members()
+    assert members is not None
+    fields, relationships = members
     assert {f.name for f in fields} == {"name"}
+    assert relationships == {}
 
     # init_forbid_extra=True -> no kwargs in signatures
-    transformer.add_initializer(fields)
+    transformer.add_initializer(fields, [])
     init_node = derived_cls.info.names["__init__"].node
     assert isinstance(init_node, FuncDef)
     assert all(arg.variable.name != "kwargs" for arg in init_node.arguments)
 
-    transformer.add_model_construct(fields)
+    transformer.add_model_construct(fields, [])
     mc_node = derived_cls.info.names["model_construct"].node
     assert isinstance(mc_node, Decorator)
     assert isinstance(mc_node.func, FuncDef)

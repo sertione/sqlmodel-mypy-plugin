@@ -14,11 +14,11 @@ class Child(Base):
 
 
 Child()
-# MYPY: error: Missing named argument "a" for "Child"  [call-arg]
-# MYPY: error: Missing named argument "c" for "Child"  [call-arg]
+# MYPY: error: Missing named argument "a"  [call-arg]
+# MYPY: error: Missing named argument "c"  [call-arg]
 Child(a=1, c=2)
 Child(a=1)
-# MYPY: error: Missing named argument "c" for "Child"  [call-arg]
+# MYPY: error: Missing named argument "c"  [call-arg]
 
 
 class Base2(SQLModel):

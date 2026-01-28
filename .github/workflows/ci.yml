@@ -33,3 +33,41 @@ jobs:
 
       - name: Check
         run: make check
+
+  compat:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.allow_failure }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Minimum supported versions (must pass).
+          - name: min
+            allow_failure: false
+            python-version: "3.12"
+            mypy: "mypy==1.19.1"
+            sqlmodel: "sqlmodel==0.0.31"
+          # Canary against latest (allowed to fail).
+          - name: latest
+            allow_failure: true
+            python-version: "3.12"
+            mypy: "mypy"
+            sqlmodel: "sqlmodel"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv (and Python)
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.27"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install (locked)
+        run: make install
+
+      - name: Override versions
+        run: uv pip install -U ${{ matrix.mypy }} ${{ matrix.sqlmodel }}
+
+      - name: Check
+        run: make check

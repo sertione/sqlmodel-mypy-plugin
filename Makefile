@@ -25,7 +25,7 @@ typecheck: ## Run mypy on plugin code.
 	uv run mypy
 
 test: ## Run tests (with >=90% coverage gate).
-	uv run pytest --cov=sqlmodel_mypy --cov-report=term-missing --cov-fail-under=90
+	uv run pytest -n auto --dist=loadscope --cov=sqlmodel_mypy --cov-report=term-missing --cov-fail-under=90
 
 check: fmt-check lint typecheck test ## Run all quality gates (what CI runs).
 
