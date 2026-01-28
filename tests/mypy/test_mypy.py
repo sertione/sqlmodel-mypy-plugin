@@ -23,6 +23,8 @@ cases: list[tuple[str, str]] = [
     ("mypy-plugin.ini", "constructor.py"),
     ("mypy-plugin-strict.ini", "constructor.py"),
     ("pyproject-plugin.toml", "constructor.py"),
+    ("mypy-plugin.ini", "nullable_defaults.py"),
+    ("mypy-plugin-strict.ini", "nullable_defaults.py"),
     ("mypy-plugin.ini", "untyped_fields.py"),
     ("mypy-plugin-no-untyped.ini", "untyped_fields.py"),
     ("mypy-plugin.ini", "inheritance.py"),

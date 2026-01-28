@@ -200,6 +200,100 @@ def test_get_has_default_covers_common_cases() -> None:
     stmt.new_syntax = True
     assert transformer.get_has_default(stmt) is True
 
+    # x: int = Field(nullable=True) -> optional
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[NameExpr("True")],
+            arg_names=["nullable"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert transformer.get_has_default(stmt) is True
+
+    # x: int = Field(sa_column=Column(..., nullable=True)) -> optional
+    col_nullable = make_field_call(
+        fullname="sqlalchemy.Column",
+        args=[NameExpr("True")],
+        arg_names=["nullable"],
+    )
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[col_nullable],
+            arg_names=["sa_column"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert transformer.get_has_default(stmt) is True
+
+    # x: int = Field(sa_column=Column(Computed(...))) -> optional
+    computed = make_field_call(
+        fullname="sqlalchemy.Computed",
+        args=[StrExpr("x")],
+        arg_names=[None],
+    )
+    col_computed = make_field_call(
+        fullname="sqlalchemy.Column",
+        args=[computed],
+        arg_names=[None],
+    )
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[col_computed],
+            arg_names=["sa_column"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert transformer.get_has_default(stmt) is True
+
+    # x: int = Field(sa_column=Column(server_default=...)) -> optional
+    col_server_default = make_field_call(
+        fullname="sqlalchemy.Column",
+        args=[NameExpr("x")],
+        arg_names=["server_default"],
+    )
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[col_server_default],
+            arg_names=["sa_column"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert transformer.get_has_default(stmt) is True
+
+    # x: int = Field(sa_column_kwargs={...}) -> optional (nullable/server_default hints)
+    sa_column_kwargs = DictExpr([(StrExpr("nullable"), NameExpr("True"))])
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[sa_column_kwargs],
+            arg_names=["sa_column_kwargs"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert transformer.get_has_default(stmt) is True
+
+    # x: int = Field(sa_column=Column()) -> required (no nullability/default hints)
+    col_plain = make_field_call(fullname="sqlalchemy.Column")
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[col_plain],
+            arg_names=["sa_column"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert transformer.get_has_default(stmt) is False
+
 
 def test_get_field_aliases_covers_common_cases() -> None:
     # alias=...

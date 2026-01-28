@@ -144,7 +144,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 15
+__version__ = 16
 
 
 class _CollectedField(NamedTuple):

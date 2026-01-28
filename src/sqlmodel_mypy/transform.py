@@ -461,11 +461,88 @@ class SQLModelTransformer:
 
         # `x: int = Field(...)`
         if isinstance(expr, CallExpr) and _callee_fullname(expr) == SQLMODEL_FIELD_FULLNAME:
+
+            def _is_none_expr(value: Expression) -> bool:
+                return isinstance(value, NameExpr) and (
+                    value.fullname == "builtins.None" or value.name == "None"
+                )
+
+            def _column_expr_is_defaultish(value: Expression) -> bool:
+                """Best-effort detection of SQLAlchemy-generated/defaultable columns.
+
+                We treat these as "optional" constructor kwargs:
+                - nullable=True
+                - server_default / default / insert_default
+                - Computed(...) columns
+                """
+                if not isinstance(value, CallExpr):
+                    return False
+
+                callee_fullname = _callee_fullname(value)
+                if callee_fullname is not None and not callee_fullname.endswith(".Column"):
+                    # Be conservative: avoid interpreting non-Column calls.
+                    return False
+
+                for c_arg, c_arg_name in zip(value.args, value.arg_names, strict=True):
+                    # Positional Computed(...) (common in declarative).
+                    if c_arg_name is None and isinstance(c_arg, CallExpr):
+                        computed_fullname = _callee_fullname(c_arg)
+                        if computed_fullname is not None and computed_fullname.endswith(
+                            ".Computed"
+                        ):
+                            return True
+
+                    # Keyword hints.
+                    if c_arg_name == "nullable" and _is_bool_nameexpr(c_arg, True):
+                        return True
+                    if c_arg_name in {"server_default", "default", "insert_default"}:
+                        if not _is_none_expr(c_arg):
+                            return True
+
+                return False
+
+            def _sa_column_kwargs_are_defaultish(value: Expression) -> bool:
+                """Best-effort for `Field(sa_column_kwargs={...})`."""
+                if not isinstance(value, DictExpr):
+                    return False
+
+                for key_expr, val_expr in value.items:
+                    if not isinstance(key_expr, StrExpr):
+                        continue
+                    if key_expr.value == "nullable" and _is_bool_nameexpr(val_expr, True):
+                        return True
+                    if key_expr.value in {"server_default", "default", "insert_default"}:
+                        if not _is_none_expr(val_expr):
+                            return True
+                return False
+
+            saw_nullable_true = False
+            sa_column_expr: Expression | None = None
+            sa_column_kwargs_expr: Expression | None = None
+
             for arg, arg_name in zip(expr.args, expr.arg_names, strict=True):
+                # Explicit default always wins.
                 if arg_name is None or arg_name == "default":
                     return arg.__class__ is not EllipsisExpr
                 if arg_name == "default_factory":
-                    return not (isinstance(arg, NameExpr) and arg.fullname == "builtins.None")
+                    return not _is_none_expr(arg)
+
+                if arg_name == "nullable" and _is_bool_nameexpr(arg, True):
+                    saw_nullable_true = True
+                elif arg_name == "sa_column":
+                    sa_column_expr = arg
+                elif arg_name == "sa_column_kwargs":
+                    sa_column_kwargs_expr = arg
+
+            if saw_nullable_true:
+                return True
+            if sa_column_expr is not None and _column_expr_is_defaultish(sa_column_expr):
+                return True
+            if sa_column_kwargs_expr is not None and _sa_column_kwargs_are_defaultish(
+                sa_column_kwargs_expr
+            ):
+                return True
+
             return False
 
         # `x: int = ...` is required
