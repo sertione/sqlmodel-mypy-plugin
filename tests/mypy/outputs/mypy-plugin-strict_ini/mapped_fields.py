@@ -13,4 +13,4 @@ User(id=1, name="x")
 
 # `Mapped[T]` should be unwrapped to `T` in the constructor signature.
 User(id=User.id, name="x")
-# MYPY: error: Argument "id" has incompatible type "InstrumentedAttribute[int]"; expected "int"  [arg-type]
+# MYPY: error: Argument "id" to "__init__" of "User" has incompatible type "InstrumentedAttribute[int]"; expected "int"  [arg-type]

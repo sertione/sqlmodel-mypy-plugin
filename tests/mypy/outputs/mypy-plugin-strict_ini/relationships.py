@@ -14,14 +14,14 @@ class Hero(SQLModel, table=True):
 
 
 Hero(team=None)
-# MYPY: error: Missing named argument "name"  [call-arg]
+# MYPY: error: Missing named argument "name" for "__init__" of "Hero"  [call-arg]
 Hero(name="x", team=None)
 
 Team(name="t", heroes=[])
 
 # Type errors only when init_typed=true
 Hero(name="x", team=1)
-# MYPY: error: Argument "team" has incompatible type "int"; expected "Team | None"  [arg-type]
+# MYPY: error: Argument "team" to "__init__" of "Hero" has incompatible type "int"; expected "Team | None"  [arg-type]
 Team(name="t", heroes=[1])
 # MYPY: error: List item 0 has incompatible type "int"; expected "Hero"  [list-item]
 
