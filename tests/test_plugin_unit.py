@@ -17,6 +17,7 @@ from mypy.nodes import (
     IfStmt,
     MemberExpr,
     NameExpr,
+    StrExpr,
     SymbolTable,
     SymbolTableNode,
     TypeInfo,
@@ -903,6 +904,298 @@ def test_col_function_hook_returns_mapped_value_type() -> None:
     assert isinstance(t, Instance)
     assert t.type.fullname == "sqlalchemy.orm.base.Mapped"
     assert t.args and isinstance(t.args[0], Instance) and t.args[0].type.fullname == "builtins.int"
+
+
+def test_getattr_function_hook_types_sqlmodel_table_members() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    model_info = make_sqlmodel_class("m.User")
+    model_info.defn.keywords["table"] = NameExpr("True")
+    model_info.metadata[plugin_mod.METADATA_KEY] = {"fields": {"id": {}}, "relationships": {}}
+
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+    model_info.names["id"] = SymbolTableNode(0, Var("id", int_t))
+
+    hook = p.get_function_hook(plugin_mod.BUILTINS_GETATTR_FULLNAME)
+    assert hook is not None
+
+    user_type = TypeType(Instance(model_info, []))
+    ctx = FunctionContext(
+        arg_types=[[user_type], [Instance(make_typeinfo("builtins.str"), [])]],
+        arg_kinds=[[ARG_POS], [ARG_POS]],
+        callee_arg_names=["object", "name"],
+        arg_names=[[None], [None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("User")], [StrExpr("id")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+    t = hook(ctx)
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "sqlalchemy.orm.attributes.InstrumentedAttribute"
+    assert t.args and isinstance(get_proper_type(t.args[0]), Instance)
+
+
+def test_getattr_function_hook_handles_table_dunder_table() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    model_info = make_sqlmodel_class("m.User")
+    model_info.defn.keywords["table"] = NameExpr("True")
+    model_info.metadata[plugin_mod.METADATA_KEY] = {"fields": {"id": {}}, "relationships": {}}
+    model_info.names["id"] = SymbolTableNode(
+        0, Var("id", Instance(make_typeinfo("builtins.int"), []))
+    )
+
+    user_type = TypeType(Instance(model_info, []))
+    ctx = FunctionContext(
+        arg_types=[[user_type], [Instance(make_typeinfo("builtins.str"), [])]],
+        arg_kinds=[[ARG_POS], [ARG_POS]],
+        callee_arg_names=["object", "name"],
+        arg_names=[[None], [None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("User")], [StrExpr("__table__")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+    t = p._sqlmodel_getattr_return_type_callback(ctx)
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "sqlalchemy.sql.schema.Table"
+
+
+def test_getattr_function_hook_types_expressionish_non_member() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    model_info = make_sqlmodel_class("m.User")
+    model_info.defn.keywords["table"] = NameExpr("True")
+    model_info.metadata[plugin_mod.METADATA_KEY] = {"fields": {}, "relationships": {}}
+
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+    mapped_t = Instance(make_typeinfo("sqlalchemy.orm.base.Mapped"), [int_t])
+    model_info.names["_ticketscount"] = SymbolTableNode(0, Var("_ticketscount", mapped_t))
+
+    user_type = TypeType(Instance(model_info, []))
+    ctx = FunctionContext(
+        arg_types=[[user_type], [Instance(make_typeinfo("builtins.str"), [])]],
+        arg_kinds=[[ARG_POS], [ARG_POS]],
+        callee_arg_names=["object", "name"],
+        arg_names=[[None], [None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("User")], [StrExpr("_ticketscount")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+    t = p._sqlmodel_getattr_return_type_callback(ctx)
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "sqlalchemy.orm.attributes.InstrumentedAttribute"
+
+
+def test_column_property_return_type_callback_infers_scalar_select() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+    scalar_select_t = Instance(make_typeinfo("sqlalchemy.sql.selectable.ScalarSelect"), [int_t])
+    ctx = FunctionContext(
+        arg_types=[[scalar_select_t]],
+        arg_kinds=[[ARG_OPT]],
+        callee_arg_names=["column"],
+        arg_names=[[None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("x")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+    t = p._sqlalchemy_column_property_return_type_callback(ctx)
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "sqlalchemy.orm.base.Mapped"
+    assert t.args and isinstance(get_proper_type(t.args[0]), Instance)
+
+
+def test_column_property_return_type_callback_infers_column_element() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+    col_t = Instance(make_typeinfo("sqlalchemy.sql.elements.ColumnElement"), [int_t])
+    ctx = FunctionContext(
+        arg_types=[[col_t]],
+        arg_kinds=[[ARG_OPT]],
+        callee_arg_names=["column"],
+        arg_names=[[None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("x")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+    t = p._sqlalchemy_column_property_return_type_callback(ctx)
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "sqlalchemy.orm.base.Mapped"
+
+
+def test_column_property_return_type_callback_preserves_precise_mapped_default() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+    scalar_select_t = Instance(make_typeinfo("sqlalchemy.sql.selectable.ScalarSelect"), [int_t])
+    default_mapped = Instance(make_typeinfo("sqlalchemy.orm.base.Mapped"), [int_t])
+    ctx = FunctionContext(
+        arg_types=[[scalar_select_t]],
+        arg_kinds=[[ARG_OPT]],
+        callee_arg_names=["column"],
+        arg_names=[[None]],
+        default_return_type=default_mapped,
+        args=[[NameExpr("x")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+    assert p._sqlalchemy_column_property_return_type_callback(ctx) is default_mapped
+
+
+def test_getattr_return_type_callback_returns_default_for_missing_member() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    model_info = make_sqlmodel_class("m.User")
+    model_info.defn.keywords["table"] = NameExpr("True")
+    model_info.metadata[plugin_mod.METADATA_KEY] = {"fields": {"id": {}}, "relationships": {}}
+    model_info.names["id"] = SymbolTableNode(
+        0, Var("id", Instance(make_typeinfo("builtins.int"), []))
+    )
+
+    user_type = TypeType(Instance(model_info, []))
+    ctx = FunctionContext(
+        arg_types=[[user_type], [Instance(make_typeinfo("builtins.str"), [])]],
+        arg_kinds=[[ARG_POS], [ARG_POS]],
+        callee_arg_names=["object", "name"],
+        arg_names=[[None], [None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("User")], [StrExpr("missing")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+    assert p._sqlmodel_getattr_return_type_callback(ctx).type_of_any == TypeOfAny.explicit  # type: ignore[attr-defined]
+
+
+def test_is_sqlalchemy_expressionish_covers_non_instance_and_other_fullnames() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    union = UnionType.make_union([Instance(make_typeinfo("builtins.int"), []), NoneType()])
+    assert p._is_sqlalchemy_expressionish(union) is False
+
+    inst_attr = Instance(
+        make_typeinfo("sqlalchemy.orm.attributes.InstrumentedAttribute"), [plugin_mod._plugin_any()]
+    )
+    assert p._is_sqlalchemy_expressionish(inst_attr) is True
+
+    queryable = Instance(
+        make_typeinfo("sqlalchemy.orm.attributes.QueryableAttribute"), [plugin_mod._plugin_any()]
+    )
+    assert p._is_sqlalchemy_expressionish(queryable) is True
+
+    col = Instance(
+        make_typeinfo("sqlalchemy.sql.elements.ColumnElement"), [plugin_mod._plugin_any()]
+    )
+    assert p._is_sqlalchemy_expressionish(col) is True
+
+
+def test_sqlalchemy_expr_type_for_class_attr_keeps_existing_expression_types() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    inst_attr = Instance(
+        make_typeinfo("sqlalchemy.orm.attributes.InstrumentedAttribute"), [plugin_mod._plugin_any()]
+    )
+    assert p._sqlalchemy_expr_type_for_class_attr(api, inst_attr) is inst_attr
+
+    queryable = Instance(
+        make_typeinfo("sqlalchemy.orm.attributes.QueryableAttribute"), [plugin_mod._plugin_any()]
+    )
+    assert p._sqlalchemy_expr_type_for_class_attr(api, queryable) is queryable
+
+    col = Instance(
+        make_typeinfo("sqlalchemy.sql.elements.ColumnElement"), [plugin_mod._plugin_any()]
+    )
+    assert p._sqlalchemy_expr_type_for_class_attr(api, col) is col
+
+
+def test_sqlalchemy_expr_type_for_class_attr_falls_back_to_column_element() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    class NoInstrumentedAPI(DummyCheckerAPI):
+        def named_generic_type(self, name: str, args: list[Type]) -> Instance:
+            if name in {
+                "sqlalchemy.orm.attributes.InstrumentedAttribute",
+                "sqlalchemy.orm.InstrumentedAttribute",
+            }:
+                raise RuntimeError("missing")
+            return super().named_generic_type(name, args)
+
+    api = NoInstrumentedAPI()
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+    t = p._sqlalchemy_expr_type_for_class_attr(api, int_t)
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "sqlalchemy.sql.elements.ColumnElement"
+
+
+def test_getattr_return_type_callback_unions_default_value() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    model_info = make_sqlmodel_class("m.User")
+    model_info.defn.keywords["table"] = NameExpr("True")
+    model_info.metadata[plugin_mod.METADATA_KEY] = {"fields": {"id": {}}, "relationships": {}}
+    model_info.names["id"] = SymbolTableNode(
+        0, Var("id", Instance(make_typeinfo("builtins.int"), []))
+    )
+
+    user_type = TypeType(Instance(model_info, []))
+    ctx = FunctionContext(
+        arg_types=[[user_type], [Instance(make_typeinfo("builtins.str"), [])], [NoneType()]],
+        arg_kinds=[[ARG_POS], [ARG_POS], [ARG_OPT]],
+        callee_arg_names=["object", "name", "default"],
+        arg_names=[[None], [None], [None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("User")], [StrExpr("id")], [NameExpr("None")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+    t = p._sqlmodel_getattr_return_type_callback(ctx)
+    assert isinstance(get_proper_type(t), UnionType)
+
+
+def test_column_property_return_type_callback_guard_and_value_type_none_paths() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    # No args -> no-op.
+    ctx = FunctionContext(
+        arg_types=[],
+        arg_kinds=[],
+        callee_arg_names=[],
+        arg_names=[],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[],
+        context=NameExpr("x"),
+        api=api,
+    )
+    assert isinstance(p._sqlalchemy_column_property_return_type_callback(ctx), AnyType)
+
+    # Unknown arg type -> value_type stays None -> no-op.
+    ctx = FunctionContext(
+        arg_types=[[Instance(make_typeinfo("builtins.int"), [])]],
+        arg_kinds=[[ARG_OPT]],
+        callee_arg_names=["column"],
+        arg_names=[[None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("x")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+    assert isinstance(p._sqlalchemy_column_property_return_type_callback(ctx), AnyType)
 
 
 def test_get_function_signature_hook_returns_none_for_missing_symbol() -> None:

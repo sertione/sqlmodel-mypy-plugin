@@ -22,7 +22,12 @@
   - Ensure common SQLModel re-exports (`select`, `and_`, `or_`, `col`, etc.) preserve SQLAlchemy typing.
   - Decide approach: plugin hooks vs stub overlays vs relying on SQLAlchemy typing (documented trade-offs).
 - Compatibility matrix CI across mypy/SQLModel versions (and pin policy).
-- Avoid forcing users to order plugins (`sqlmodel_mypy.plugin` vs `pydantic.mypy`) for correct SQLModel resolution.
+- **Plugin ordering guardrails (mypy limitation)**
+  - **Reality check**: mypy generally uses the **first plugin that claims a hook**, so true “order independence”
+    between `sqlmodel_mypy.plugin` and `pydantic.mypy` is not realistically achievable today.
+  - Enforce and clearly explain that `sqlmodel_mypy.plugin` must be listed **before** `pydantic.mypy`:
+    - Source: `src/sqlmodel_mypy/plugin.py` (`SQLModelMypyPlugin.__init__`, `_sqlmodel_metaclass_callback()`).
+    - User-facing docs: `README.md` (plugin ordering section).
 
 ## v0.4 (Docs-aligned relationship constructors) - DONE
 
@@ -200,3 +205,85 @@ models do provide this at runtime for `table=True`, but type checkers can miss i
 - **Tests**
   - Add mypy integration coverage for `Model.__table__` and `Session.get` / `AsyncSession.get` with SQLModel
     table models.
+
+## v0.12.4 (Dynamic query-builder helpers) - DONE
+
+- Type `getattr(Model, "field")` like `Model.field` for `table=True` SQLModel models (string-literal names only).
+- Best-effort typing for `column_property(...)` return type (infer `Mapped[T]`) to support
+  `Model._foo = column_property(...)` patterns.
+
+## v0.13 (SQLModel docs parity suite) - TODO
+
+**Motivation**: the north star is “SQLModel as documented works under `mypy --strict` with minimal casts/ignores”.
+We should lock this down with a dedicated docs-parity integration suite (beyond the current focused unit-style
+mypy modules).
+
+- **Add docs-derived mypy integration modules**
+  - Create minimal, type-focused modules under `tests/mypy/modules/` that mirror official docs patterns (as close
+    as possible, but stripped of runtime/demo noise).
+  - Add them to `tests/mypy/test_mypy.py` and commit golden outputs under `tests/mypy/outputs/**`.
+  - Target doc pages / patterns:
+    - Connected-data joins and outer-joins:
+      - Docs: `https://sqlmodel.tiangolo.com/tutorial/connect/read-connected-data/`
+    - Relationship attribute creation/update patterns (constructor kwargs + mutation):
+      - Docs: `https://sqlmodel.tiangolo.com/tutorial/relationship-attributes/create-and-update-relationships/`
+    - Many-to-many relationship creation patterns:
+      - Docs: `https://sqlmodel.tiangolo.com/tutorial/many-to-many/create-data/`
+    - Update patterns using `sqlmodel_update()` / `model_dump(exclude_unset=True)`:
+      - Docs: `https://sqlmodel.tiangolo.com/tutorial/fastapi/update/`
+      - Source: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py` (`SQLModel.sqlmodel_update`)
+  - Ensure strict-mode expectations are explicit (via `# MYPY:` comments and/or `reveal_type(...)` assertions).
+
+## v0.14 (`typing.Annotated[...]` field metadata support) - TODO
+
+**Motivation**: SQLModel (Pydantic v2) supports `Annotated`-driven typing patterns, and users will naturally try to
+use them to reduce `= Field(...)` assignment noise. Under `--strict`, we should still generate correct constructor
+signatures (required/optional + alias kwargs) when `Field(...)` metadata lives inside `Annotated[...]`.
+
+- **Support `Annotated[T, Field(...)]` for constructor/signature generation**
+  - Examples we should handle (at least best-effort):
+    - `id: Annotated[int | None, Field(default=None, primary_key=True)]`
+    - `name: Annotated[str, Field(alias="full_name")]`
+    - The historical SQLModel edge-case: `Optional[Annotated[T, ...]]` (see upstream release notes).
+  - Implementation sketch:
+    - Extend semantic-phase collection in `src/sqlmodel_mypy/transform.py` to extract Field metadata from the
+      annotation when there is no `= Field(...)` call in the class body.
+    - Mirror the same logic in checker-time signature collection in `src/sqlmodel_mypy/plugin.py`
+      (`_collect_member_from_stmt`) so class-call signatures stay consistent with generated `__init__`.
+  - Source references:
+    - SQLModel `Field()` overloads + alias precedence: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py`
+    - `Annotated` handling in SQLModel’s type parsing: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/_compat.py`
+    - Release note: “Fix support for types with `Optional[Annotated[x, f()]]`…” (PR #1093):
+      `https://github.com/fastapi/sqlmodel/pull/1093`
+
+## v0.15 (Outer-join `None` propagation for relationship-attribute joins) - TODO
+
+**Motivation**: we currently propagate `None` on outer-joins only when the join target is a direct model class
+(e.g. `.join(Team, isouter=True)`). A common ORM pattern is to join via relationship attributes
+(e.g. `.join(Hero.team, isouter=True)`), and the result tuple should still reflect that the joined entity may be
+`None`.
+
+- **Expand join-target detection**
+  - Extend `src/sqlmodel_mypy/plugin.py` (`_sqlalchemy_select_join_like_return_type`) to also detect join targets
+    expressed as relationship attributes (e.g. `Hero.team`, `Team.heroes`) and map them to the target model type
+    for `None` propagation.
+  - References:
+    - SQLModel outer-join behavior (baseline example): `https://sqlmodel.tiangolo.com/tutorial/connect/read-connected-data/`
+    - SQLAlchemy relationship-attribute joins (`select(User).join(User.addresses)`): `https://docs.sqlalchemy.org/en/20/orm/queryguide/select.html#simple-relationship-joins`
+  - Add mypy integration coverage under `tests/mypy/modules/` for relationship-attribute joins, including the SQLModel
+    docs pattern of `Team: None` on outer-joins.
+
+## v0.16 (Strict typing ergonomics add-ons, opt-in) - TODO
+
+**Motivation**: strict typing + SQLModel often means the database populates values “later” (after flush/commit/
+refresh), especially primary keys (`id: int | None`). Mypy can’t infer those runtime effects, and users end up with
+repeated `assert obj.id is not None` (type clutter).
+
+- **Provide a tiny opt-in narrowing helper**
+  - Docs context (why `id` starts as `None` and is populated after commit/refresh):
+    - `https://sqlmodel.tiangolo.com/tutorial/automatic-id-none-refresh/`
+  - Ship a small helper in this package (runtime-free or near-zero runtime) that helps users narrow “persisted” models
+    without `cast(...)`/`# type: ignore`, e.g.:
+    - `assert_persisted(obj)` / `require_id(obj)` / `ensure_persisted(obj)` returning a `TypeGuard[...]` or using
+      overloads to narrow `id` to `int`.
+  - Keep it optional and well-documented; default plugin behavior should remain conservative.

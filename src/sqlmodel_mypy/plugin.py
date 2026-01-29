@@ -27,6 +27,7 @@ from mypy.nodes import (
     MemberExpr,
     NameExpr,
     RefExpr,
+    StrExpr,
     SymbolTableNode,
     TypeInfo,
     Var,
@@ -81,6 +82,8 @@ ERROR_PLUGIN_ORDER = ErrorCode(
     "SQLModel",
 )
 
+BUILTINS_GETATTR_FULLNAME = "builtins.getattr"
+
 SQLMODEL_COL_FULLNAME = "sqlmodel.sql.expression.col"
 # SQLModel's `select()` is implemented in a generated module and re-exported.
 SQLMODEL_SELECT_GEN_FULLNAME = "sqlmodel.sql._expression_select_gen.select"
@@ -93,6 +96,13 @@ SQLMODEL_SELECT_FULLNAMES = {
 SQLALCHEMY_INSTRUMENTED_ATTRIBUTE_FULLNAMES = {
     "sqlalchemy.orm.InstrumentedAttribute",
     "sqlalchemy.orm.attributes.InstrumentedAttribute",
+}
+
+SQLALCHEMY_COLUMN_PROPERTY_FULLNAMES = {
+    # Imported from `sqlalchemy.orm` (common user import).
+    "sqlalchemy.orm.column_property",
+    # May resolve to the internal defining module depending on stubs/version.
+    "sqlalchemy.orm._orm_constructors.column_property",
 }
 
 SQLALCHEMY_SELECT_FULLNAME = "sqlalchemy.sql.selectable.Select"
@@ -144,7 +154,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 16
+__version__ = 17
 
 
 class _CollectedField(NamedTuple):
@@ -456,6 +466,10 @@ class SQLModelMypyPlugin(Plugin):
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
         if fullname == SQLMODEL_COL_FULLNAME:
             return self._sqlmodel_col_return_type_callback
+        if fullname == BUILTINS_GETATTR_FULLNAME:
+            return self._sqlmodel_getattr_return_type_callback
+        if fullname in SQLALCHEMY_COLUMN_PROPERTY_FULLNAMES:
+            return self._sqlalchemy_column_property_return_type_callback
         return None
 
     def report_config_data(self, ctx: ReportConfigContext) -> dict[str, Any]:
@@ -1158,6 +1172,196 @@ class SQLModelMypyPlugin(Plugin):
             if info is not None:
                 return Instance(info, [value_type])
         return ctx.default_return_type
+
+    @staticmethod
+    def _lookup_var_in_mro(info: TypeInfo, name: str) -> Var | None:
+        """Find a `Var` named `name` in `info` or its MRO (best-effort)."""
+        for base in info.mro:
+            sym = base.names.get(name)
+            if sym is not None and isinstance(sym.node, Var):
+                return sym.node
+        return None
+
+    @staticmethod
+    def _is_sqlalchemy_expressionish(tp: Type) -> bool:
+        """Return True if `tp` already looks like a SQLAlchemy expression/descriptor type."""
+        proper = get_proper_type(tp)
+        if not isinstance(proper, Instance):
+            return False
+        if proper.type.fullname in SQLALCHEMY_MAPPED_FULLNAMES:
+            return True
+        if proper.type.fullname in SQLALCHEMY_INSTRUMENTED_ATTRIBUTE_FULLNAMES:
+            return True
+        if proper.type.fullname == "sqlalchemy.orm.attributes.QueryableAttribute":
+            return True
+        if proper.type.fullname in {
+            "sqlalchemy.sql.elements.ColumnElement",
+            "sqlalchemy.sql.expression.ColumnElement",
+        }:
+            return True
+        return False
+
+    def _sqlalchemy_instrumented_attribute_type(self, api: Any, value_type: Type) -> Type | None:
+        for fullname in (
+            "sqlalchemy.orm.attributes.InstrumentedAttribute",
+            "sqlalchemy.orm.InstrumentedAttribute",
+        ):
+            try:
+                return cast(Type, api.named_generic_type(fullname, [value_type]))
+            except Exception:
+                continue
+        return None
+
+    def _sqlalchemy_column_element_type(self, api: Any, value_type: Type) -> Type | None:
+        for fullname in (
+            "sqlalchemy.sql.elements.ColumnElement",
+            "sqlalchemy.sql.expression.ColumnElement",
+        ):
+            try:
+                return cast(Type, api.named_generic_type(fullname, [value_type]))
+            except Exception:
+                continue
+        return None
+
+    def _sqlalchemy_expr_type_for_class_attr(self, api: Any, declared_type: Type) -> Type:
+        """Return the type of `Model.attr` in SQL expressions, given declared instance type.
+
+        This mirrors `_sqlmodel_class_attr_type_callback` but works from a `Type`.
+        """
+        proper = get_proper_type(declared_type)
+        if isinstance(proper, Instance):
+            # If the attribute is already typed as an ORM descriptor/expression, keep it.
+            if proper.type.fullname in SQLALCHEMY_INSTRUMENTED_ATTRIBUTE_FULLNAMES:
+                return declared_type
+            if proper.type.fullname == "sqlalchemy.orm.attributes.QueryableAttribute":
+                return declared_type
+            if proper.type.fullname in {
+                "sqlalchemy.sql.elements.ColumnElement",
+                "sqlalchemy.sql.expression.ColumnElement",
+            }:
+                return declared_type
+
+            # `Mapped[T]` is a descriptor; class-level access behaves like an instrumented attribute.
+            if proper.type.fullname in SQLALCHEMY_MAPPED_FULLNAMES and proper.args:
+                value_type = proper.args[0]
+                inst = self._sqlalchemy_instrumented_attribute_type(api, value_type)
+                if inst is not None:
+                    return inst
+
+        inst = self._sqlalchemy_instrumented_attribute_type(api, declared_type)
+        if inst is not None:
+            return inst
+        col = self._sqlalchemy_column_element_type(api, declared_type)
+        if col is not None:
+            return col
+        return declared_type
+
+    def _sqlmodel_getattr_return_type_callback(self, ctx: FunctionContext) -> Type:
+        """Type `getattr(Model, \"field\")` like `Model.field` for SQLModel table models."""
+        if not ctx.args or len(ctx.args) < 2:
+            return ctx.default_return_type
+        if not ctx.args[0] or not ctx.args[1]:
+            return ctx.default_return_type
+
+        name_expr = ctx.args[1][0]
+        if not isinstance(name_expr, StrExpr):
+            return ctx.default_return_type
+        attr_name = name_expr.value
+
+        if not ctx.arg_types or not ctx.arg_types[0]:
+            return ctx.default_return_type
+        obj_type = get_proper_type(ctx.arg_types[0][0])
+
+        owner_info: TypeInfo | None = None
+        if isinstance(obj_type, TypeType):
+            item = get_proper_type(obj_type.item)
+            if isinstance(item, Instance):
+                owner_info = item.type
+        if owner_info is None:
+            return ctx.default_return_type
+        if owner_info.fullname == SQLMODEL_BASEMODEL_FULLNAME:
+            return ctx.default_return_type
+        if not owner_info.has_base(SQLMODEL_BASEMODEL_FULLNAME):
+            return ctx.default_return_type
+        if not _is_table_model(owner_info):
+            return ctx.default_return_type
+
+        # Mirror `Model.__table__` support.
+        if attr_name == "__table__":
+            return self._sqlalchemy_table_type(ctx.api)
+
+        # Prefer SQLModel members (fields/relationships): treat as SQLAlchemy expressions.
+        var = self._lookup_var_in_mro(owner_info, attr_name)
+        if (
+            var is not None
+            and var.type is not None
+            and self._declares_sqlmodel_member(owner_info, attr_name)
+        ):
+            tp = self._sqlalchemy_expr_type_for_class_attr(ctx.api, var.type)
+        # For non-SQLModel attributes, only special-case SQLAlchemy expression-like descriptors.
+        elif (
+            var is not None and var.type is not None and self._is_sqlalchemy_expressionish(var.type)
+        ):
+            tp = self._sqlalchemy_expr_type_for_class_attr(ctx.api, var.type)
+        else:
+            return ctx.default_return_type
+
+        # If a default value is provided, union it in (best-effort).
+        if len(ctx.arg_types) >= 3 and ctx.arg_types[2]:
+            default_t = ctx.arg_types[2][0]
+            return UnionType.make_union([tp, default_t])
+        return tp
+
+    def _sqlalchemy_mapped_type(self, api: Any, value_type: Type) -> Type | None:
+        for fullname in ("sqlalchemy.orm.base.Mapped", "sqlalchemy.orm.Mapped"):
+            try:
+                return cast(Type, api.named_generic_type(fullname, [value_type]))
+            except Exception:
+                continue
+        return None
+
+    def _sqlalchemy_column_property_return_type_callback(self, ctx: FunctionContext) -> Type:
+        """Best-effort typing for `sqlalchemy.orm.column_property(...)`.
+
+        This is primarily used to support patterns like:
+            `Model._ticketscount = column_property(select(...).scalar_subquery())`
+        where users later want `getattr(Model, "_ticketscount")` to behave like an ORM attribute.
+        """
+        default = ctx.default_return_type
+        if not ctx.arg_types or not ctx.arg_types[0]:
+            return default
+
+        # If SQLAlchemy stubs already provide a precise mapped type, keep it.
+        proper_default = get_proper_type(default)
+        if (
+            isinstance(proper_default, Instance)
+            and proper_default.type.fullname in SQLALCHEMY_MAPPED_FULLNAMES
+            and proper_default.args
+            and not isinstance(get_proper_type(proper_default.args[0]), AnyType)
+        ):
+            return default
+
+        # Infer `T` from the first argument type.
+        arg0 = get_proper_type(ctx.arg_types[0][0])
+        value_type: Type | None = None
+        if isinstance(arg0, Instance) and arg0.args:
+            if arg0.type.fullname in {
+                "sqlalchemy.sql.selectable.ScalarSelect",
+                "sqlalchemy.sql.expression.ScalarSelect",
+                "sqlalchemy.sql.selectable.ScalarSubquery",
+            }:
+                value_type = arg0.args[0]
+            if arg0.type.fullname in {
+                "sqlalchemy.sql.elements.ColumnElement",
+                "sqlalchemy.sql.expression.ColumnElement",
+            }:
+                value_type = arg0.args[0]
+
+        if value_type is None:
+            return default
+
+        mapped = self._sqlalchemy_mapped_type(ctx.api, value_type)
+        return mapped or default
 
     def _sqlmodel_model_class_callback(self, ctx: ClassDefContext) -> None:
         # SQLModel is built on Pydantic v2; users commonly override `model_config`
