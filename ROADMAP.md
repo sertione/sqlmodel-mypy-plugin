@@ -273,7 +273,7 @@ signatures (required/optional + alias kwargs) when `Field(...)` metadata lives i
   - Add mypy integration coverage under `tests/mypy/modules/` for relationship-attribute joins, including the SQLModel
     docs pattern of `Team: None` on outer-joins.
 
-## v0.16 (Strict typing ergonomics add-ons, opt-in) - TODO
+## v0.16 (Strict typing ergonomics add-ons, opt-in) - DONE
 
 **Motivation**: strict typing + SQLModel often means the database populates values “later” (after flush/commit/
 refresh), especially primary keys (`id: int | None`). Mypy can’t infer those runtime effects, and users end up with

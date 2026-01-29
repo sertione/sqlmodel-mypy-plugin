@@ -72,6 +72,7 @@ cases: list[tuple[str, str]] = [
     ("mypy-plugin-strict.ini", "docs_parity_relationship_attributes.py"),
     ("mypy-plugin-strict.ini", "docs_parity_many_to_many_create_data.py"),
     ("mypy-plugin-strict.ini", "docs_parity_update_patterns.py"),
+    ("mypy-plugin-strict.ini", "persisted_helpers.py"),
     ("mypy-plugin-strict.ini", "annotated_field_metadata.py"),
 ]
 
