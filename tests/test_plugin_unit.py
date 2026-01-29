@@ -20,6 +20,7 @@ from mypy.nodes import (
     StrExpr,
     SymbolTable,
     SymbolTableNode,
+    TempNode,
     TypeInfo,
     Var,
 )
@@ -1402,6 +1403,30 @@ def test_collect_member_from_stmt_untyped_and_skip_paths() -> None:
     )
     stmt.new_syntax = True
     assert p._collect_member_from_stmt(stmt, defining_info=info, current_info=info, api=api) is None
+
+
+def test_collect_member_from_stmt_prefers_metadata_for_default_and_aliases() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+    info = make_sqlmodel_class("m.User")
+
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+    info.names["x"] = SymbolTableNode(0, Var("x", int_t))
+
+    # No RHS (TempNode) means we can't infer Field(...) metadata from stmt.rvalue.
+    stmt = plugin_mod.AssignmentStmt(
+        [NameExpr("x")], TempNode(AnyType(TypeOfAny.special_form), no_rhs=True)
+    )
+    stmt.new_syntax = True
+
+    info.metadata[plugin_mod.METADATA_KEY] = {
+        "fields": {"x": {"has_default": True, "aliases": ["alias_x"]}}
+    }
+
+    member = p._collect_member_from_stmt(stmt, defining_info=info, current_info=info, api=api)
+    assert isinstance(member, plugin_mod._CollectedField)
+    assert member.has_default is True
+    assert member.aliases == ("alias_x",)
 
 
 def test_model_construct_signature_callback_guard_paths_and_instance_receiver() -> None:

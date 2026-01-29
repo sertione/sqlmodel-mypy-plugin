@@ -212,7 +212,7 @@ models do provide this at runtime for `table=True`, but type checkers can miss i
 - Best-effort typing for `column_property(...)` return type (infer `Mapped[T]`) to support
   `Model._foo = column_property(...)` patterns.
 
-## v0.13 (SQLModel docs parity suite) - TODO
+## v0.13 (SQLModel docs parity suite) - DONE
 
 **Motivation**: the north star is “SQLModel as documented works under `mypy --strict` with minimal casts/ignores”.
 We should lock this down with a dedicated docs-parity integration suite (beyond the current focused unit-style
@@ -234,7 +234,7 @@ mypy modules).
       - Source: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py` (`SQLModel.sqlmodel_update`)
   - Ensure strict-mode expectations are explicit (via `# MYPY:` comments and/or `reveal_type(...)` assertions).
 
-## v0.14 (`typing.Annotated[...]` field metadata support) - TODO
+## v0.14 (`typing.Annotated[...]` field metadata support) - DONE
 
 **Motivation**: SQLModel (Pydantic v2) supports `Annotated`-driven typing patterns, and users will naturally try to
 use them to reduce `= Field(...)` assignment noise. Under `--strict`, we should still generate correct constructor

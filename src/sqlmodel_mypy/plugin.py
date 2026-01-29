@@ -154,7 +154,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 17
+__version__ = 18
 
 
 class _CollectedField(NamedTuple):
@@ -628,9 +628,24 @@ class SQLModelMypyPlugin(Plugin):
         if sym.node.is_classvar:
             return None
 
-        has_default = SQLModelTransformer.get_has_default(stmt)
-        aliases = tuple(SQLModelTransformer.get_field_aliases(stmt))
         init_type = sym.node.type
+        has_default = SQLModelTransformer.get_has_default(stmt)
+        aliases: tuple[str, ...] = tuple(SQLModelTransformer.get_field_aliases(stmt))
+
+        # Prefer semantic-phase metadata when available (keeps checker-time fallback
+        # consistent with plugin-generated signatures, including Annotated Field metadata).
+        md = defining_info.metadata.get(METADATA_KEY)
+        if isinstance(md, dict):
+            fields = md.get("fields")
+            if isinstance(fields, dict):
+                data = fields.get(name)
+                if isinstance(data, dict):
+                    md_has_default = data.get("has_default")
+                    if isinstance(md_has_default, bool):
+                        has_default = md_has_default
+                    md_aliases = data.get("aliases")
+                    if isinstance(md_aliases, list):
+                        aliases = tuple(a for a in md_aliases if isinstance(a, str))
         if init_type is not None and defining_info is not current_info:
             with state.strict_optional_set(api.options.strict_optional):
                 init_type = map_type_from_supertype(init_type, current_info, defining_info)

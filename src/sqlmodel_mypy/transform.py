@@ -9,6 +9,7 @@ This module is intentionally small and focused:
 
 from __future__ import annotations
 
+import ast
 import keyword
 from collections.abc import Iterator
 from typing import Any, Protocol
@@ -91,6 +92,221 @@ def _plugin_any() -> AnyType:
 
 
 ERROR_FIELD = ErrorCode("sqlmodel-field", "SQLModel field error", "SQLModel")
+
+
+def _parse_annotated_field_metadata_by_line(source: str) -> dict[int, tuple[bool, list[str]]]:
+    """Return mapping of line -> (has_default, aliases) for Annotated Field metadata.
+
+    Best-effort support for patterns like:
+    - `x: Annotated[T, Field(...)]`
+    - `x: Optional[Annotated[T, Field(...)] ]`
+
+    Only handles class-body `AnnAssign` nodes with **no assignment value** (i.e. `x: ...`).
+    """
+
+    def _call_func_name(expr: ast.expr) -> str | None:
+        if isinstance(expr, ast.Name):
+            return expr.id
+        if isinstance(expr, ast.Attribute):
+            return expr.attr
+        return None
+
+    def _call_get_kwarg(call: ast.Call, name: str) -> ast.expr | None:
+        for kw in call.keywords:
+            if kw.arg == name:
+                return kw.value
+        return None
+
+    def _subscript_args(slice_expr: ast.expr) -> list[ast.expr]:
+        if isinstance(slice_expr, ast.Tuple):
+            return list(slice_expr.elts)
+        return [slice_expr]
+
+    def _is_none(expr: ast.expr) -> bool:
+        return isinstance(expr, ast.Constant) and expr.value is None
+
+    def _is_true(expr: ast.expr) -> bool:
+        return isinstance(expr, ast.Constant) and expr.value is True
+
+    def _is_ellipsis(expr: ast.expr) -> bool:
+        return isinstance(expr, ast.Constant) and expr.value is Ellipsis
+
+    def _literal_str_or_none(expr: ast.expr) -> str | None:
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return expr.value
+        if _is_none(expr):
+            return None
+        return None
+
+    def _is_usable_kwarg_name(name: str) -> bool:
+        return name.isidentifier() and not keyword.iskeyword(name)
+
+    def _field_aliases_from_call(call: ast.Call) -> list[str]:
+        alias_expr = _call_get_kwarg(call, "alias")
+        alias_arg = _literal_str_or_none(alias_expr) if alias_expr is not None else None
+
+        validation_alias_expr = _call_get_kwarg(call, "validation_alias")
+        validation_alias_arg = (
+            _literal_str_or_none(validation_alias_expr)
+            if validation_alias_expr is not None
+            else None
+        )
+        schema_validation_alias: str | None = None
+
+        schema_extra_expr = _call_get_kwarg(call, "schema_extra")
+        if isinstance(schema_extra_expr, ast.Dict):
+            for key_expr, val_expr in zip(
+                schema_extra_expr.keys, schema_extra_expr.values, strict=True
+            ):
+                if isinstance(key_expr, ast.Constant) and isinstance(key_expr.value, str):
+                    if key_expr.value == "validation_alias":
+                        schema_validation_alias = _literal_str_or_none(val_expr)
+
+        validation_alias_final = validation_alias_arg or schema_validation_alias or alias_arg
+
+        aliases: list[str] = []
+        for candidate in (alias_arg, validation_alias_final):
+            if candidate is None:
+                continue
+            if not _is_usable_kwarg_name(candidate):
+                continue
+            if candidate in aliases:
+                continue
+            aliases.append(candidate)
+        return aliases
+
+    def _column_expr_is_defaultish(expr: ast.expr) -> bool:
+        if not isinstance(expr, ast.Call):
+            return False
+
+        callee_name = _call_func_name(expr.func)
+        if callee_name is not None and not callee_name.endswith("Column"):
+            return False
+
+        for arg in expr.args:
+            if isinstance(arg, ast.Call):
+                computed_name = _call_func_name(arg.func)
+                if computed_name is not None and computed_name.endswith("Computed"):
+                    return True
+
+        for kw in expr.keywords:
+            if kw.arg == "nullable" and _is_true(kw.value):
+                return True
+            if kw.arg in {"server_default", "default", "insert_default"} and not _is_none(kw.value):
+                return True
+        return False
+
+    def _sa_column_kwargs_are_defaultish(expr: ast.expr) -> bool:
+        if not isinstance(expr, ast.Dict):
+            return False
+        for key_expr, val_expr in zip(expr.keys, expr.values, strict=True):
+            if not (isinstance(key_expr, ast.Constant) and isinstance(key_expr.value, str)):
+                continue
+            if key_expr.value == "nullable" and _is_true(val_expr):
+                return True
+            if key_expr.value in {"server_default", "default", "insert_default"} and not _is_none(
+                val_expr
+            ):
+                return True
+        return False
+
+    def _field_has_default_from_call(call: ast.Call) -> bool:
+        # Explicit default always wins.
+        default_expr = _call_get_kwarg(call, "default")
+        if default_expr is None and call.args:
+            default_expr = call.args[0]
+        if default_expr is not None:
+            return not _is_ellipsis(default_expr)
+
+        factory_expr = _call_get_kwarg(call, "default_factory")
+        if factory_expr is not None:
+            return not _is_none(factory_expr)
+
+        nullable_expr = _call_get_kwarg(call, "nullable")
+        if nullable_expr is not None and _is_true(nullable_expr):
+            return True
+
+        sa_column_expr = _call_get_kwarg(call, "sa_column")
+        if sa_column_expr is not None and _column_expr_is_defaultish(sa_column_expr):
+            return True
+
+        sa_column_kwargs_expr = _call_get_kwarg(call, "sa_column_kwargs")
+        if sa_column_kwargs_expr is not None and _sa_column_kwargs_are_defaultish(
+            sa_column_kwargs_expr
+        ):
+            return True
+
+        return False
+
+    def _find_field_call_in_annotation(expr: ast.expr) -> ast.Call | None:
+        # PEP 604 unions: `X | None`
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.BitOr):
+            return _find_field_call_in_annotation(expr.left) or _find_field_call_in_annotation(
+                expr.right
+            )
+
+        if isinstance(expr, ast.Subscript):
+            base_name = _call_func_name(expr.value)
+            args = _subscript_args(expr.slice)
+
+            if base_name == "Annotated" and len(args) >= 2:
+                for meta in args[1:]:
+                    if isinstance(meta, ast.Call) and _call_func_name(meta.func) == "Field":
+                        return meta
+                return None
+
+            if base_name in {"Optional", "Union"}:
+                for item in args:
+                    found = _find_field_call_in_annotation(item)
+                    if found is not None:
+                        return found
+
+        return None
+
+    out: dict[int, tuple[bool, list[str]]] = {}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return out
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.class_depth = 0
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            self.class_depth += 1
+            self.generic_visit(node)
+            self.class_depth -= 1
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            # Don't descend into methods / nested functions.
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+            return
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
+            if self.class_depth <= 0:
+                return
+            if node.value is not None:
+                return
+            if not isinstance(node.target, ast.Name):
+                return
+
+            field_call = _find_field_call_in_annotation(node.annotation)
+            if field_call is None:
+                return
+
+            out[node.lineno] = (
+                _field_has_default_from_call(field_call),
+                _field_aliases_from_call(field_call),
+            )
+
+    _Visitor().visit(tree)
+    return out
 
 
 class ForceInvariantTypeVars(TypeTranslator):
@@ -279,6 +495,34 @@ class SQLModelTransformer:
         self._reason = reason
         self._api = api
         self.plugin_config = plugin_config
+        self._annotated_field_metadata_by_line: dict[int, tuple[bool, list[str]]] | None = None
+
+    def _get_annotated_field_metadata_by_line(self) -> dict[int, tuple[bool, list[str]]]:
+        if self._annotated_field_metadata_by_line is not None:
+            return self._annotated_field_metadata_by_line
+
+        # Best-effort: only available when mypy provides module path info.
+        path = ""
+        try:
+            mod = self._api.modules.get(self._api.cur_mod_id)
+            if mod is not None:
+                path = mod.path
+        except Exception:
+            path = ""
+
+        if not path:
+            self._annotated_field_metadata_by_line = {}
+            return self._annotated_field_metadata_by_line
+
+        try:
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
+        except OSError:
+            self._annotated_field_metadata_by_line = {}
+            return self._annotated_field_metadata_by_line
+
+        self._annotated_field_metadata_by_line = _parse_annotated_field_metadata_by_line(src)
+        return self._annotated_field_metadata_by_line
 
     def transform(self) -> bool:
         info = self._cls.info
@@ -441,6 +685,10 @@ class SQLModelTransformer:
 
         has_default = self.get_has_default(stmt)
         aliases = self.get_field_aliases(stmt)
+        if isinstance(stmt.rvalue, TempNode):
+            annotated = self._get_annotated_field_metadata_by_line().get(stmt.line)
+            if annotated is not None:
+                has_default, aliases = annotated
         init_type = node.type
 
         return SQLModelField(
@@ -456,8 +704,6 @@ class SQLModelTransformer:
     @staticmethod
     def get_has_default(stmt: AssignmentStmt) -> bool:
         expr = stmt.rvalue
-        if isinstance(expr, TempNode):
-            return False
 
         # `x: int = Field(...)`
         if isinstance(expr, CallExpr) and _callee_fullname(expr) == SQLMODEL_FIELD_FULLNAME:
@@ -543,6 +789,9 @@ class SQLModelTransformer:
             ):
                 return True
 
+            return False
+
+        if isinstance(expr, TempNode):
             return False
 
         # `x: int = ...` is required
