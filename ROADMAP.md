@@ -256,7 +256,7 @@ signatures (required/optional + alias kwargs) when `Field(...)` metadata lives i
     - Release note: “Fix support for types with `Optional[Annotated[x, f()]]`…” (PR #1093):
       `https://github.com/fastapi/sqlmodel/pull/1093`
 
-## v0.15 (Outer-join `None` propagation for relationship-attribute joins) - TODO
+## v0.15 (Outer-join `None` propagation for relationship-attribute joins) - DONE
 
 **Motivation**: we currently propagate `None` on outer-joins only when the join target is a direct model class
 (e.g. `.join(Team, isouter=True)`). A common ORM pattern is to join via relationship attributes

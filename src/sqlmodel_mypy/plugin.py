@@ -154,7 +154,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 18
+__version__ = 19
 
 
 class _CollectedField(NamedTuple):
@@ -1079,6 +1079,108 @@ class SQLModelMypyPlugin(Plugin):
         except Exception:
             return _plugin_any()
 
+    def _typeinfo_from_join_target_expr(self, expr: Expression | None, api: Any) -> TypeInfo | None:
+        """Return a best-effort `TypeInfo` for a join target expression.
+
+        Supports direct model-class targets (e.g. `join(Team)`) and relationship
+        attribute targets (e.g. `join(Hero.team)`).
+        """
+        info = _typeinfo_from_ref_expr(expr)
+        if info is not None:
+            return info
+        return self._typeinfo_from_relationship_join_target(expr, api)
+
+    def _typeinfo_from_relationship_join_target(
+        self, expr: Expression | None, api: Any
+    ) -> TypeInfo | None:
+        """Infer join target model type from `Model.relationship` expressions."""
+        if not isinstance(expr, MemberExpr):
+            return None
+
+        owner_info = _typeinfo_from_ref_expr(expr.expr)
+        if owner_info is None:
+            return None
+        if owner_info.fullname == SQLMODEL_BASEMODEL_FULLNAME:
+            return None
+        if not owner_info.has_base(SQLMODEL_BASEMODEL_FULLNAME):
+            return None
+        if not _is_table_model(owner_info):
+            return None
+
+        rel_name = expr.name
+        try:
+            _fields, relationships = self._collect_members_for_signature(owner_info, api)
+        except Exception:
+            return None
+
+        rel_type: Type | None = None
+        for rel in relationships:
+            if rel.name == rel_name:
+                rel_type = rel.type
+                break
+        if rel_type is None:
+            return None
+
+        entity_type = self._unwrap_relationship_entity_type(rel_type)
+        if entity_type is None:
+            return None
+        proper = get_proper_type(entity_type)
+        if not isinstance(proper, Instance):
+            return None
+
+        target_info = proper.type
+        if not target_info.has_base(SQLMODEL_BASEMODEL_FULLNAME):
+            return None
+        return target_info
+
+    @classmethod
+    def _unwrap_relationship_entity_type(cls, typ: Type) -> Type | None:
+        """Return the related entity type for relationship annotations.
+
+        Examples:
+        - `Team | None` -> `Team`
+        - `list[Hero]` -> `Hero`
+        - `Mapped[list[Hero]]` -> `Hero`
+        """
+        typ = _unwrap_mapped_type(typ)
+        proper = get_proper_type(typ)
+
+        if isinstance(proper, UnionType):
+            non_none: list[Type] = []
+            for item in proper.items:
+                if isinstance(get_proper_type(item), NoneType):
+                    continue
+                non_none.append(item)
+            if len(non_none) != 1:
+                return None
+            return cls._unwrap_relationship_entity_type(non_none[0])
+
+        if isinstance(proper, Instance):
+            # Relationship types may appear wrapped as ORM descriptor/expression types.
+            if proper.type.fullname in SQLALCHEMY_INSTRUMENTED_ATTRIBUTE_FULLNAMES and proper.args:
+                return cls._unwrap_relationship_entity_type(proper.args[0])
+            if (
+                proper.type.fullname == "sqlalchemy.orm.attributes.QueryableAttribute"
+                and proper.args
+            ):
+                return cls._unwrap_relationship_entity_type(proper.args[0])
+
+            # One-to-many / many-to-many relationships are commonly annotated as `list[T]`.
+            if proper.args and proper.type.fullname in {
+                "builtins.list",
+                "builtins.set",
+                "builtins.frozenset",
+                "collections.abc.Sequence",
+                "typing.Sequence",
+                "typing.List",
+                "typing.Set",
+                "typing.FrozenSet",
+            }:
+                return cls._unwrap_relationship_entity_type(proper.args[0])
+            return typ
+
+        return None
+
     def _sqlalchemy_select_join_like_return_type(
         self, ctx: MethodContext, *, target_positional_index: int, isouter_always: bool
     ) -> Type:
@@ -1095,7 +1197,7 @@ class SQLModelMypyPlugin(Plugin):
                 return ctx.default_return_type
 
         target_expr = _call_get_arg(call, "target", target_positional_index)
-        target_info = _typeinfo_from_ref_expr(target_expr)
+        target_info = self._typeinfo_from_join_target_expr(target_expr, ctx.api)
         if target_info is None:
             return ctx.default_return_type
 

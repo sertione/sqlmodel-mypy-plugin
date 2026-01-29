@@ -509,6 +509,264 @@ def test_select_join_isouter_true_makes_joined_entity_optional_in_return_type() 
     assert any(isinstance(get_proper_type(it), NoneType) for it in second.items)
 
 
+def test_select_join_isouter_true_with_relationship_target_makes_joined_entity_optional_in_return_type() -> (
+    None
+):
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    hero_info = make_sqlmodel_class("m.Hero")
+    hero_info.defn.keywords["table"] = NameExpr("True")
+
+    team_info = make_sqlmodel_class("m.Team")
+    team_info.defn.keywords["table"] = NameExpr("True")
+
+    team_t = Instance(team_info, [])
+    rel_t = UnionType.make_union([team_t, NoneType()])
+    hero_info.names["team"] = SymbolTableNode(0, Var("team", rel_t))
+    stmt_team = plugin_mod.AssignmentStmt(
+        [NameExpr("team")], make_call(plugin_mod.SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_team.new_syntax = True
+    hero_info.defn.defs.body.append(stmt_team)
+
+    tuple_info = make_typeinfo("builtins.tuple")
+    fallback = Instance(tuple_info, [AnyType(TypeOfAny.explicit)])
+    tp = TupleType([Instance(hero_info, []), Instance(team_info, [])], fallback)
+
+    select_info = make_typeinfo("sqlalchemy.sql.selectable.Select")
+    select_inst = Instance(select_info, [tp])
+
+    hero_expr = NameExpr("Hero")
+    hero_expr.node = hero_info
+    target_expr = MemberExpr(hero_expr, "team")
+
+    true_expr = NameExpr("True")
+    call = CallExpr(
+        NameExpr("join"),
+        [target_expr, true_expr],
+        [ARG_POS, ARG_NAMED],
+        [None, "isouter"],
+    )
+
+    hook = p.get_method_hook("sqlalchemy.sql.selectable.Select.join")
+    assert hook is not None
+
+    ctx = MethodContext(
+        type=select_inst,
+        arg_types=[
+            [AnyType(TypeOfAny.explicit)],
+            [Instance(make_typeinfo("builtins.bool"), [])],
+        ],
+        arg_kinds=[[ARG_POS], [ARG_NAMED]],
+        callee_arg_names=["target", "isouter"],
+        arg_names=[[None], ["isouter"]],
+        default_return_type=select_inst,
+        args=[[target_expr], [true_expr]],
+        context=call,
+        api=DummyCheckerAPI(),
+    )
+    t = hook(ctx)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    tp2 = get_proper_type(proper.args[0])
+    assert isinstance(tp2, TupleType)
+    second = get_proper_type(tp2.items[1])
+    assert isinstance(second, UnionType)
+    assert any(isinstance(get_proper_type(it), NoneType) for it in second.items)
+
+
+def test_select_join_isouter_true_with_relationship_target_list_makes_joined_entity_optional_in_return_type() -> (
+    None
+):
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    hero_info = make_sqlmodel_class("m.Hero")
+    hero_info.defn.keywords["table"] = NameExpr("True")
+
+    team_info = make_sqlmodel_class("m.Team")
+    team_info.defn.keywords["table"] = NameExpr("True")
+
+    list_info = make_typeinfo("builtins.list")
+    rel_t = Instance(list_info, [Instance(hero_info, [])])
+    team_info.names["heroes"] = SymbolTableNode(0, Var("heroes", rel_t))
+    stmt_heroes = plugin_mod.AssignmentStmt(
+        [NameExpr("heroes")], make_call(plugin_mod.SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_heroes.new_syntax = True
+    team_info.defn.defs.body.append(stmt_heroes)
+
+    tuple_info = make_typeinfo("builtins.tuple")
+    fallback = Instance(tuple_info, [AnyType(TypeOfAny.explicit)])
+    tp = TupleType([Instance(team_info, []), Instance(hero_info, [])], fallback)
+
+    select_info = make_typeinfo("sqlalchemy.sql.selectable.Select")
+    select_inst = Instance(select_info, [tp])
+
+    team_expr = NameExpr("Team")
+    team_expr.node = team_info
+    target_expr = MemberExpr(team_expr, "heroes")
+
+    true_expr = NameExpr("True")
+    call = CallExpr(
+        NameExpr("join"),
+        [target_expr, true_expr],
+        [ARG_POS, ARG_NAMED],
+        [None, "isouter"],
+    )
+
+    hook = p.get_method_hook("sqlalchemy.sql.selectable.Select.join")
+    assert hook is not None
+
+    ctx = MethodContext(
+        type=select_inst,
+        arg_types=[
+            [AnyType(TypeOfAny.explicit)],
+            [Instance(make_typeinfo("builtins.bool"), [])],
+        ],
+        arg_kinds=[[ARG_POS], [ARG_NAMED]],
+        callee_arg_names=["target", "isouter"],
+        arg_names=[[None], ["isouter"]],
+        default_return_type=select_inst,
+        args=[[target_expr], [true_expr]],
+        context=call,
+        api=DummyCheckerAPI(),
+    )
+    t = hook(ctx)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    tp2 = get_proper_type(proper.args[0])
+    assert isinstance(tp2, TupleType)
+    second = get_proper_type(tp2.items[1])
+    assert isinstance(second, UnionType)
+    assert any(isinstance(get_proper_type(it), NoneType) for it in second.items)
+
+
+def test_typeinfo_from_relationship_join_target_returns_none_when_target_is_not_member_expr() -> (
+    None
+):
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+    assert p._typeinfo_from_relationship_join_target(NameExpr("x"), api) is None
+
+
+def test_typeinfo_from_relationship_join_target_returns_none_when_owner_is_unresolved() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+    expr = MemberExpr(NameExpr("Hero"), "team")
+    assert p._typeinfo_from_relationship_join_target(expr, api) is None
+
+
+def test_typeinfo_from_relationship_join_target_returns_none_when_owner_is_sqlmodel_base() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    sqlmodel_info = make_typeinfo(plugin_mod.SQLMODEL_BASEMODEL_FULLNAME)
+    sqlmodel_expr = NameExpr("SQLModel")
+    sqlmodel_expr.node = sqlmodel_info
+    expr = MemberExpr(sqlmodel_expr, "team")
+
+    assert p._typeinfo_from_relationship_join_target(expr, api) is None
+
+
+def test_typeinfo_from_relationship_join_target_returns_none_when_owner_is_not_sqlmodel() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    owner_info = make_typeinfo("m.NotSQLModel")
+    obj_info = make_typeinfo("builtins.object")
+    owner_info.mro = [owner_info, obj_info]
+
+    owner_expr = NameExpr("Hero")
+    owner_expr.node = owner_info
+    expr = MemberExpr(owner_expr, "team")
+
+    assert p._typeinfo_from_relationship_join_target(expr, api) is None
+
+
+def test_typeinfo_from_relationship_join_target_returns_none_when_owner_is_not_table_model() -> (
+    None
+):
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    owner_info = make_sqlmodel_class("m.Hero")
+    owner_expr = NameExpr("Hero")
+    owner_expr.node = owner_info
+    expr = MemberExpr(owner_expr, "team")
+
+    assert p._typeinfo_from_relationship_join_target(expr, api) is None
+
+
+def test_typeinfo_from_relationship_join_target_returns_none_when_relationship_missing() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    owner_info = make_sqlmodel_class("m.Hero")
+    owner_info.defn.keywords["table"] = NameExpr("True")
+
+    owner_expr = NameExpr("Hero")
+    owner_expr.node = owner_info
+    expr = MemberExpr(owner_expr, "team")
+
+    assert p._typeinfo_from_relationship_join_target(expr, api) is None
+
+
+def test_typeinfo_from_relationship_join_target_returns_none_for_ambiguous_union_relationship_type() -> (
+    None
+):
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    owner_info = make_sqlmodel_class("m.Hero")
+    owner_info.defn.keywords["table"] = NameExpr("True")
+
+    team_info = make_sqlmodel_class("m.Team")
+    team_info.defn.keywords["table"] = NameExpr("True")
+
+    other_info = make_sqlmodel_class("m.Other")
+    other_info.defn.keywords["table"] = NameExpr("True")
+
+    rel_t = UnionType.make_union([Instance(team_info, []), Instance(other_info, []), NoneType()])
+    owner_info.names["team"] = SymbolTableNode(0, Var("team", rel_t))
+    stmt_team = plugin_mod.AssignmentStmt(
+        [NameExpr("team")], make_call(plugin_mod.SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_team.new_syntax = True
+    owner_info.defn.defs.body.append(stmt_team)
+
+    owner_expr = NameExpr("Hero")
+    owner_expr.node = owner_info
+    expr = MemberExpr(owner_expr, "team")
+
+    assert p._typeinfo_from_relationship_join_target(expr, api) is None
+
+
+def test_typeinfo_from_relationship_join_target_returns_none_for_non_sqlmodel_entity_type() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    owner_info = make_sqlmodel_class("m.Hero")
+    owner_info.defn.keywords["table"] = NameExpr("True")
+
+    not_model_info = make_typeinfo("m.NotModel")
+    obj_info = make_typeinfo("builtins.object")
+    not_model_info.mro = [not_model_info, obj_info]
+
+    rel_t = UnionType.make_union([Instance(not_model_info, []), NoneType()])
+    owner_info.names["team"] = SymbolTableNode(0, Var("team", rel_t))
+    stmt_team = plugin_mod.AssignmentStmt(
+        [NameExpr("team")], make_call(plugin_mod.SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_team.new_syntax = True
+    owner_info.defn.defs.body.append(stmt_team)
+
+    owner_expr = NameExpr("Hero")
+    owner_expr.node = owner_info
+    expr = MemberExpr(owner_expr, "team")
+
+    assert p._typeinfo_from_relationship_join_target(expr, api) is None
+
+
 def test_select_join_without_isouter_keeps_return_type() -> None:
     p = plugin_mod.SQLModelMypyPlugin(Options())
 
