@@ -53,6 +53,8 @@ cases: list[tuple[str, str]] = [
     ("mypy-plugin.ini", "relationship_comparators.py"),
     ("mypy-plugin.ini", "selectinload.py"),
     ("mypy-plugin-strict.ini", "selectinload.py"),
+    ("mypy-plugin.ini", "getattr_column_property.py"),
+    ("mypy-plugin-strict.ini", "getattr_column_property.py"),
     ("mypy-plugin.ini", "execution_options.py"),
     ("mypy-plugin-strict.ini", "execution_options.py"),
     ("mypy-plugin.ini", "aliases.py"),

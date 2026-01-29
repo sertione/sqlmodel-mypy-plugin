@@ -122,6 +122,18 @@ You can also use SQLAlchemy table metadata attributes without `attr-defined` noi
 tbl = User.__table__
 ```
 
+### `getattr(Model, "field")` support
+
+If you build query filters dynamically, `getattr(Model, "field")` with a **string literal** is typed the same as
+direct `Model.field` access on `table=True` models:
+
+```py
+stmt = select(User).where(getattr(User, "name").like("%x%"))
+```
+
+Non-literal names (runtime strings) are intentionally left as `Any` (you’ll still need a cast or a different
+pattern).
+
 ### Relationship comparator typing
 
 Relationship attributes declared via `Relationship(...)` are typed as SQLAlchemy expressions at class level,
@@ -135,9 +147,11 @@ stmt = select(Team).where(Team.heroes.contains(hero_obj))
 
 ### Out of scope
 
-- **`column_property(...)` and similar SQLAlchemy helpers**: this plugin doesn’t try to “fix” the *declaration-site*
-  typing for SQLAlchemy-only APIs that aren’t part of SQLModel’s surface area. Prefer SQLAlchemy-typed patterns like
-  `Mapped[...]` / `InstrumentedAttribute[...]` (or local casts/`# type: ignore` if needed).
+- **Most SQLAlchemy-only declaration helpers**: this plugin doesn’t try to “fix” the full *declaration-site* typing
+  for SQLAlchemy ORM APIs that aren’t part of SQLModel’s surface area.
+  - Exception: best-effort return typing for `column_property(...)` (infers `Mapped[T]` from `ScalarSelect[T]` /
+    `ColumnElement[T]`) to support patterns like `Model._foo = column_property(...)` combined with
+    `getattr(Model, "_foo")` in query builders.
 - **Pydantic `@computed_field`**: not touched by this plugin (it should type-check via normal property typing / Pydantic
   typing).
 
