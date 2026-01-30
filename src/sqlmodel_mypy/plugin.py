@@ -51,6 +51,7 @@ from mypy.types import (
     CallableType,
     FunctionLike,
     Instance,
+    LiteralType,
     NoneType,
     TupleType,
     Type,
@@ -157,9 +158,13 @@ SQLALCHEMY_RELATIONSHIP_COMPARATOR_METHOD_FULLNAMES = {
 
 SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
+SQLMODEL_SESSION_EXECUTE_FULLNAME = "sqlmodel.orm.session.Session.execute"
+SQLMODEL_ASYNC_SESSION_EXECUTE_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.execute"
+
+SQLMODEL_SELECT_OF_SCALAR_CLS_FULLNAME = "sqlmodel.sql._expression_select_cls.SelectOfScalar"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 22
+__version__ = 23
 
 
 class _CollectedField(NamedTuple):
@@ -502,6 +507,15 @@ class SQLModelMypyPlugin(Plugin):
             or fullname.endswith(".contains")
         ):
             return self._sqlalchemy_relationship_comparator_return_type_callback
+        if self.plugin_config.typed_execute:
+            if fullname == SQLMODEL_SESSION_EXECUTE_FULLNAME:
+                return lambda ctx: self._sqlmodel_session_execute_return_type_callback(
+                    ctx, is_async=False
+                )
+            if fullname == SQLMODEL_ASYNC_SESSION_EXECUTE_FULLNAME:
+                return lambda ctx: self._sqlmodel_session_execute_return_type_callback(
+                    ctx, is_async=True
+                )
         return None
 
     def get_class_attribute_hook(self, fullname: str) -> Callable[[AttributeContext], Type] | None:
@@ -536,6 +550,8 @@ class SQLModelMypyPlugin(Plugin):
         return _hook
 
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
+        if fullname in SQLMODEL_SELECT_FULLNAMES:
+            return self._sqlmodel_select_return_type_callback
         if fullname == SQLMODEL_COL_FULLNAME:
             return self._sqlmodel_col_return_type_callback
         if fullname in SQLMODEL_TUPLE_FULLNAMES:
@@ -836,20 +852,6 @@ class SQLModelMypyPlugin(Plugin):
         if not isinstance(default, CallableType):
             return default
 
-        try:
-            sa_type_index = default.arg_names.index("sa_type")
-        except ValueError:
-            return default
-
-        old_sa_type = default.arg_types[sa_type_index]
-        proper_old_sa_type = get_proper_type(old_sa_type)
-        if isinstance(proper_old_sa_type, AnyType):
-            return default
-
-        type_engine_info = _lookup_typeinfo(self, "sqlalchemy.sql.type_api.TypeEngine")
-        if type_engine_info is None:
-            return default
-
         def _contains_instance_fullname(tp: Type, fullname: str) -> bool:
             proper = get_proper_type(tp)
             if isinstance(proper, Instance):
@@ -858,17 +860,57 @@ class SQLModelMypyPlugin(Plugin):
                 return any(_contains_instance_fullname(item, fullname) for item in proper.items)
             return False
 
-        # Idempotency: if upstream stubs already accept TypeEngine instances, keep unchanged.
-        if _contains_instance_fullname(old_sa_type, type_engine_info.fullname):
-            return default
-
-        any_t = _plugin_any()
-        type_engine_args = [any_t] * len(type_engine_info.defn.type_vars)
-        type_engine_instance = Instance(type_engine_info, type_engine_args)
-
+        changed = False
         new_arg_types = list(default.arg_types)
-        new_arg_types[sa_type_index] = UnionType.make_union([old_sa_type, type_engine_instance])
-        return default.copy_modified(arg_types=new_arg_types)
+        any_t = _plugin_any()
+
+        # 1) Widen `sa_type` to accept TypeEngine instances.
+        try:
+            sa_type_index = default.arg_names.index("sa_type")
+        except ValueError:
+            sa_type_index = -1
+        if sa_type_index >= 0:
+            old_sa_type = default.arg_types[sa_type_index]
+            proper_old_sa_type = get_proper_type(old_sa_type)
+            if not isinstance(proper_old_sa_type, AnyType):
+                type_engine_info = _lookup_typeinfo(self, "sqlalchemy.sql.type_api.TypeEngine")
+                if type_engine_info is not None:
+                    # Idempotency: if upstream stubs already accept TypeEngine instances, keep unchanged.
+                    if not _contains_instance_fullname(old_sa_type, type_engine_info.fullname):
+                        type_engine_args = [any_t] * len(type_engine_info.defn.type_vars)
+                        type_engine_instance = Instance(type_engine_info, type_engine_args)
+                        new_arg_types[sa_type_index] = UnionType.make_union(
+                            [old_sa_type, type_engine_instance]
+                        )
+                        changed = True
+
+        # 2) Widen `validation_alias` to accept Pydantic v2 alias helpers (AliasPath/AliasChoices).
+        try:
+            validation_alias_index = default.arg_names.index("validation_alias")
+        except ValueError:
+            validation_alias_index = -1
+        if validation_alias_index >= 0:
+            old_validation_alias = default.arg_types[validation_alias_index]
+            proper_old_validation_alias = get_proper_type(old_validation_alias)
+            if not isinstance(proper_old_validation_alias, AnyType):
+                alias_path_info = _lookup_typeinfo(self, "pydantic.aliases.AliasPath")
+                alias_choices_info = _lookup_typeinfo(self, "pydantic.aliases.AliasChoices")
+                if alias_path_info is not None and alias_choices_info is not None:
+                    # Idempotency: if upstream stubs already accept these, keep unchanged.
+                    if not (
+                        _contains_instance_fullname(old_validation_alias, alias_path_info.fullname)
+                        or _contains_instance_fullname(
+                            old_validation_alias, alias_choices_info.fullname
+                        )
+                    ):
+                        alias_path = Instance(alias_path_info, [])
+                        alias_choices = Instance(alias_choices_info, [])
+                        new_arg_types[validation_alias_index] = UnionType.make_union(
+                            [old_validation_alias, alias_path, alias_choices]
+                        )
+                        changed = True
+
+        return default.copy_modified(arg_types=new_arg_types) if changed else default
 
     def _sqlmodel_select_signature_callback(self, ctx: FunctionSigContext) -> FunctionLike:
         """Avoid `select()` overload ceiling by adding a 5+ args fallback.
@@ -917,7 +959,9 @@ class SQLModelMypyPlugin(Plugin):
         ):
             return ctx.default_signature
 
-        select_info = _lookup_typeinfo(self, SQLALCHEMY_SELECT_FULLNAME)
+        select_info = _lookup_typeinfo(self, SQLMODEL_SELECT_CLS_FULLNAME) or _lookup_typeinfo(
+            self, SQLALCHEMY_SELECT_FULLNAME
+        )
         if select_info is None:
             return ctx.default_signature
 
@@ -931,6 +975,108 @@ class SQLModelMypyPlugin(Plugin):
         arg_kinds: list[ArgKind] = [ARG_POS] * positional_count
         arg_names = [f"__ent{i}" for i in range(positional_count)]
         return CallableType(arg_types, arg_kinds, arg_names, ret_type, fallback)
+
+    def _sqlmodel_select_return_type_callback(self, ctx: FunctionContext) -> Type:
+        """Best-effort typed return for `select(5+ entities)`.
+
+        Our signature hook for 5+ args deliberately uses `Any` to avoid "no overload matches"
+        errors. Here, once mypy has inferred argument expression types, we recover a more precise
+        `Select[tuple[...]]` element type for the common cases (models + column expressions).
+        """
+        call = ctx.context
+        if not isinstance(call, CallExpr):
+            return ctx.default_return_type
+
+        # Mirror the signature-hook guardrails: only handle straightforward positional calls.
+        if any(k in {ARG_STAR, ARG_STAR2} for k in call.arg_kinds):
+            return ctx.default_return_type
+        if any(name is not None for name in call.arg_names):
+            return ctx.default_return_type
+        if any(k != ARG_POS for k in call.arg_kinds):
+            return ctx.default_return_type
+
+        positional_count = len(call.arg_kinds)
+        if positional_count <= 4:
+            return ctx.default_return_type
+
+        default = ctx.default_return_type
+        proper_default = get_proper_type(default)
+        if not isinstance(proper_default, Instance) or not proper_default.args:
+            return default
+        proper_row = get_proper_type(proper_default.args[0])
+        if not isinstance(proper_row, TupleType):
+            return default
+
+        # Only override our own conservative fallback (tuple of Any); keep upstream precision.
+        if not proper_row.items or not all(
+            isinstance(get_proper_type(item), AnyType) for item in proper_row.items
+        ):
+            return default
+
+        if not ctx.arg_types or len(ctx.arg_types) < positional_count:
+            return default
+
+        items: list[Type] = []
+        for i in range(positional_count):
+            if not ctx.arg_types[i]:
+                items.append(_plugin_any())
+                continue
+            items.append(self._sqlmodel_select_entity_result_type(ctx.arg_types[i][0]))
+
+        # Preserve the tuple fallback type mypy expects for a fixed-length tuple.
+        any_t = _plugin_any()
+        tuple_fallback = ctx.api.named_generic_type("builtins.tuple", [any_t])
+        row_type = TupleType(items, tuple_fallback)
+        return Instance(proper_default.type, [row_type])
+
+    def _sqlmodel_select_entity_result_type(self, typ: Type) -> Type:
+        """Return the value type produced by an entity passed to `select(...)`.
+
+        Examples:
+        - `Hero` (type[Hero]) -> `Hero`
+        - `Hero.id` (InstrumentedAttribute[int | None]) -> `int | None`
+        - `ColumnElement[str]` -> `str`
+        - Scalars (e.g. `int`, `str`) -> unchanged
+        """
+        proper = get_proper_type(typ)
+        if isinstance(proper, AnyType):
+            return _plugin_any()
+        if isinstance(proper, UnionType):
+            return UnionType.make_union(
+                [self._sqlmodel_select_entity_result_type(item) for item in proper.items]
+            )
+        if isinstance(proper, TypeType):
+            item = get_proper_type(proper.item)
+            if isinstance(item, Instance):
+                return Instance(item.type, item.args)
+            return _plugin_any()
+        if isinstance(proper, Instance):
+            if proper.type.fullname in SQLALCHEMY_MAPPED_FULLNAMES and proper.args:
+                return proper.args[0]
+            if proper.type.fullname in SQLALCHEMY_INSTRUMENTED_ATTRIBUTE_FULLNAMES and proper.args:
+                return proper.args[0]
+            if (
+                proper.type.fullname == "sqlalchemy.orm.attributes.QueryableAttribute"
+                and proper.args
+            ):
+                return proper.args[0]
+            if proper.type.fullname == "sqlalchemy.sql.elements.SQLCoreOperations" and proper.args:
+                return proper.args[0]
+            if (
+                proper.type.fullname == "sqlalchemy.sql.roles.TypedColumnsClauseRole"
+                and proper.args
+            ):
+                return proper.args[0]
+            if (
+                proper.type.fullname
+                in {
+                    "sqlalchemy.sql.elements.ColumnElement",
+                    "sqlalchemy.sql.expression.ColumnElement",
+                }
+                and proper.args
+            ):
+                return proper.args[0]
+        return typ
 
     def _sqlalchemy_tuple_expr_type(self, api: Any | None = None) -> Type:
         """Return the best available SQLAlchemy tuple expression type.
@@ -1141,6 +1287,116 @@ class SQLModelMypyPlugin(Plugin):
         new_arg_types[0] = UnionType.make_union([default.arg_types[0], sqlalchemy_executable])
         return default.copy_modified(arg_types=new_arg_types)
 
+    def _sqlmodel_session_execute_return_type_callback(
+        self, ctx: MethodContext, *, is_async: bool
+    ) -> Type:
+        """Optionally type SQLModel's deprecated `Session.execute()` / `AsyncSession.execute()`.
+
+        SQLAlchemy's `Session.execute()` has a typed overload for `TypedReturnsRows[_T] -> Result[_T]`,
+        but SQLModel overrides `execute()` and annotates it as returning `Result[Any]`.
+
+        When `typed_execute=true`, recover a typed `Result[...]` for common `select(...)` statements
+        without requiring users to migrate every call site to `Session.exec()`.
+        """
+        if not self.plugin_config.typed_execute:
+            return ctx.default_return_type
+
+        call = ctx.context
+        if not isinstance(call, CallExpr):
+            return ctx.default_return_type
+
+        # Find the `statement` argument (positional-0 or `statement=`).
+        statement_index: int | None = None
+        for i, name in enumerate(call.arg_names):
+            if name == "statement":
+                statement_index = i
+                break
+        if statement_index is None:
+            positional = 0
+            for i, name in enumerate(call.arg_names):
+                if name is None:
+                    if positional == 0:
+                        statement_index = i
+                        break
+                    positional += 1
+        if statement_index is None:
+            return ctx.default_return_type
+
+        if not ctx.arg_types or len(ctx.arg_types) <= statement_index:
+            return ctx.default_return_type
+        if not ctx.arg_types[statement_index]:
+            return ctx.default_return_type
+
+        row_tuple_type = self._row_tuple_type_from_typed_statement(
+            ctx.arg_types[statement_index][0], ctx.api
+        )
+        if row_tuple_type is None:
+            return ctx.default_return_type
+
+        result_type = self._sqlalchemy_result_type(ctx.api, row_tuple_type)
+        if result_type is None:
+            return ctx.default_return_type
+
+        if not is_async:
+            return result_type
+
+        # Async methods return a Coroutine/Awaitable; preserve the wrapper when possible.
+        default = ctx.default_return_type
+        proper_default = get_proper_type(default)
+        if isinstance(proper_default, Instance):
+            if (
+                proper_default.type.fullname in {"typing.Coroutine", "collections.abc.Coroutine"}
+                and len(proper_default.args) == 3
+            ):
+                return Instance(
+                    proper_default.type,
+                    [proper_default.args[0], proper_default.args[1], result_type],
+                )
+            if (
+                proper_default.type.fullname in {"typing.Awaitable", "collections.abc.Awaitable"}
+                and len(proper_default.args) == 1
+            ):
+                return Instance(proper_default.type, [result_type])
+
+        any_t = _plugin_any()
+        coro = _named_generic_type_or_none(ctx.api, "typing.Coroutine", [any_t, any_t, result_type])
+        return coro or default
+
+    def _row_tuple_type_from_typed_statement(self, statement: Type, api: Any) -> Type | None:
+        """Infer the row tuple type produced by a SQL statement (best-effort)."""
+        proper = get_proper_type(statement)
+
+        if not isinstance(proper, Instance) or not proper.args:
+            return None
+
+        # SQLModel's SelectOfScalar[T] represents "one entity" selects; SQLAlchemy Result is still row-based.
+        if proper.type.fullname == SQLMODEL_SELECT_OF_SCALAR_CLS_FULLNAME:
+            scalar_t = proper.args[0]
+            any_t = _plugin_any()
+            tuple_fallback = api.named_generic_type("builtins.tuple", [any_t])
+            return TupleType([scalar_t], tuple_fallback)
+
+        # SQLModel Select[T] and SQLAlchemy Select[_TP] both store the row parameter in the first type argument.
+        if proper.type.fullname in {
+            SQLMODEL_SELECT_CLS_FULLNAME,
+            SQLALCHEMY_SELECT_FULLNAME,
+        } or proper.type.has_base(SQLALCHEMY_SELECT_FULLNAME):
+            return proper.args[0]
+
+        return None
+
+    def _sqlalchemy_result_type(self, api: Any, row_tuple_type: Type) -> Type | None:
+        """Return `sqlalchemy.engine.Result[row_tuple_type]` (best-effort)."""
+        for fullname in ("sqlalchemy.engine.Result", "sqlalchemy.engine.result.Result"):
+            inst = _named_generic_type_or_none(api, fullname, [row_tuple_type])
+            if inst is not None:
+                return inst
+            info = _lookup_typeinfo(self, fullname)
+            if info is not None:
+                args = [row_tuple_type] * len(info.defn.type_vars)
+                return Instance(info, args)
+        return None
+
     def _sqlalchemy_select_join_return_type_callback(self, ctx: MethodContext) -> Type:
         # join(target, onclause=None, *, isouter: bool = False, full: bool = False)
         return self._sqlalchemy_select_join_like_return_type(
@@ -1228,7 +1484,51 @@ class SQLModelMypyPlugin(Plugin):
         info = _typeinfo_from_ref_expr(expr)
         if info is not None:
             return info
+        info = self._typeinfo_from_typed_join_target_expr(expr)
+        if info is not None:
+            return info
         return self._typeinfo_from_relationship_join_target(expr, api)
+
+    def _typeinfo_from_typed_join_target_expr(self, expr: Expression | None) -> TypeInfo | None:
+        """Infer join target model type from a typed reference (e.g. `team_alias`)."""
+        if not isinstance(expr, NameExpr):
+            return None
+        if not isinstance(expr.node, Var):
+            return None
+        if expr.node.type is None:
+            return None
+        return self._typeinfo_from_typed_join_target_type(expr.node.type)
+
+    def _typeinfo_from_typed_join_target_type(self, typ: Type) -> TypeInfo | None:
+        """Extract a model `TypeInfo` from common join-target types.
+
+        Supports patterns like:
+        - `team_alias = aliased(Team)` (typed as `Annotated[Type[Team], \"aliased\"]`)
+        - `team_t: type[Team] = Team`
+        """
+        proper = get_proper_type(typ)
+        if isinstance(proper, AnyType):
+            return None
+        if isinstance(proper, UnionType):
+            infos = [self._typeinfo_from_typed_join_target_type(item) for item in proper.items]
+            non_none = [i for i in infos if i is not None]
+            if len(non_none) == 1:
+                return non_none[0]
+            if non_none and all(i.fullname == non_none[0].fullname for i in non_none):
+                return non_none[0]
+            return None
+        if isinstance(proper, TypeType):
+            item = get_proper_type(proper.item)
+            if isinstance(item, Instance):
+                return item.type
+            return None
+        if isinstance(proper, Instance):
+            # Some SQLAlchemy helpers use `AliasedClass[T]` (rare with SQLModel, but common in ORM code).
+            if proper.type.fullname == "sqlalchemy.orm.util.AliasedClass" and proper.args:
+                arg0 = get_proper_type(proper.args[0])
+                if isinstance(arg0, Instance):
+                    return arg0.type
+        return None
 
     def _typeinfo_from_relationship_join_target(
         self, expr: Expression | None, api: Any
@@ -1542,9 +1842,31 @@ class SQLModelMypyPlugin(Plugin):
             return ctx.default_return_type
 
         name_expr = ctx.args[1][0]
-        if not isinstance(name_expr, StrExpr):
+
+        def _extract_string_literals(tp: Type) -> list[str]:
+            """Return string literal values from `tp` (best-effort)."""
+            proper = get_proper_type(tp)
+            if isinstance(proper, LiteralType) and isinstance(proper.value, str):
+                return [proper.value]
+            if isinstance(proper, UnionType):
+                out: list[str] = []
+                for item in proper.items:
+                    out.extend(_extract_string_literals(item))
+                return out
+            return []
+
+        attr_names: list[str] = []
+        if isinstance(name_expr, StrExpr):
+            attr_names = [name_expr.value]
+        elif ctx.arg_types and len(ctx.arg_types) >= 2 and ctx.arg_types[1]:
+            attr_names = _extract_string_literals(ctx.arg_types[1][0])
+        elif isinstance(name_expr, NameExpr) and isinstance(name_expr.node, Var):
+            # Best-effort support for `Final` module/class constants.
+            if isinstance(name_expr.node.final_value, str):
+                attr_names = [name_expr.node.final_value]
+
+        if not attr_names:
             return ctx.default_return_type
-        attr_name = name_expr.value
 
         if not ctx.arg_types or not ctx.arg_types[0]:
             return ctx.default_return_type
@@ -1564,25 +1886,37 @@ class SQLModelMypyPlugin(Plugin):
         if not _is_table_model(owner_info):
             return ctx.default_return_type
 
-        # Mirror `Model.__table__` support.
-        if attr_name == "__table__":
-            return self._sqlalchemy_table_type(ctx.api)
+        def _type_for_attr_name(attr_name: str) -> Type | None:
+            # Mirror `Model.__table__` support.
+            if attr_name == "__table__":
+                return self._sqlalchemy_table_type(ctx.api)
 
-        # Prefer SQLModel members (fields/relationships): treat as SQLAlchemy expressions.
-        var = self._lookup_var_in_mro(owner_info, attr_name)
-        if (
-            var is not None
-            and var.type is not None
-            and self._declares_sqlmodel_member(owner_info, attr_name)
-        ):
-            tp = self._sqlalchemy_expr_type_for_class_attr(ctx.api, var.type)
-        # For non-SQLModel attributes, only special-case SQLAlchemy expression-like descriptors.
-        elif (
-            var is not None and var.type is not None and self._is_sqlalchemy_expressionish(var.type)
-        ):
-            tp = self._sqlalchemy_expr_type_for_class_attr(ctx.api, var.type)
-        else:
-            return ctx.default_return_type
+            # Prefer SQLModel members (fields/relationships): treat as SQLAlchemy expressions.
+            var = self._lookup_var_in_mro(owner_info, attr_name)
+            if (
+                var is not None
+                and var.type is not None
+                and self._declares_sqlmodel_member(owner_info, attr_name)
+            ):
+                return self._sqlalchemy_expr_type_for_class_attr(ctx.api, var.type)
+
+            # For non-SQLModel attributes, only special-case SQLAlchemy expression-like descriptors.
+            if (
+                var is not None
+                and var.type is not None
+                and self._is_sqlalchemy_expressionish(var.type)
+            ):
+                return self._sqlalchemy_expr_type_for_class_attr(ctx.api, var.type)
+            return None
+
+        tps: list[Type] = []
+        for attr_name in attr_names:
+            tp = _type_for_attr_name(attr_name)
+            if tp is None:
+                return ctx.default_return_type
+            tps.append(tp)
+
+        tp = UnionType.make_union(tps) if len(tps) > 1 else tps[0]
 
         # If a default value is provided, union it in (best-effort).
         if len(ctx.arg_types) >= 3 and ctx.arg_types[2]:
@@ -1737,12 +2071,14 @@ class SQLModelPluginConfig:
         "init_typed",
         "init_forbid_extra",
         "warn_untyped_fields",
+        "typed_execute",
         "debug_dataclass_transform",
     )
 
     init_typed: bool
     init_forbid_extra: bool
     warn_untyped_fields: bool
+    typed_execute: bool
     debug_dataclass_transform: bool  # undocumented, for testing
 
     def __init__(self, options: Options) -> None:
@@ -1750,6 +2086,7 @@ class SQLModelPluginConfig:
         self.init_typed = False
         self.init_forbid_extra = False
         self.warn_untyped_fields = True
+        self.typed_execute = False
         self.debug_dataclass_transform = False
 
         if options.config_file is None:

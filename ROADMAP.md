@@ -23,7 +23,7 @@
   - Decide approach: plugin hooks vs stub overlays vs relying on SQLAlchemy typing (documented trade-offs).
 - Compatibility matrix CI across mypy/SQLModel versions (and pin policy).
 - **Plugin ordering guardrails (mypy limitation)**
-  - **Reality check**: mypy generally uses the **first plugin that claims a hook**, so true “order independence”
+  - **Reality check**: mypy generally uses the **first plugin that claims a hook**, so true "order independence"
     between `sqlmodel_mypy.plugin` and `pydantic.mypy` is not realistically achievable today.
   - Enforce and clearly explain that `sqlmodel_mypy.plugin` must be listed **before** `pydantic.mypy`:
     - Source: `src/sqlmodel_mypy/plugin.py` (`SQLModelMypyPlugin.__init__`, `_sqlmodel_metaclass_callback()`).
@@ -31,9 +31,9 @@
 
 ## v0.4 (Docs-aligned relationship constructors) - DONE
 
-**Motivation**: SQLModel’s official docs pass relationship attributes in constructors (e.g. `Hero(team=team)`,
+**Motivation**: SQLModel's official docs pass relationship attributes in constructors (e.g. `Hero(team=team)`,
 `Team(heroes=[...])`). v0.4 accepts relationship kwargs in generated `__init__` / `model_construct` for
-`table=True` models, so `init_forbid_extra=true` no longer causes false-positive “unexpected keyword argument”
+`table=True` models, so `init_forbid_extra=true` no longer causes false-positive "unexpected keyword argument"
 errors for documented patterns.
 
 - **Accept relationship kwargs in generated `__init__` / `model_construct` (table models)**
@@ -63,17 +63,17 @@ errors for documented patterns.
     pattern (and keep types conservative).
   - Update/add mypy integration tests to match the chosen strategy.
 
-## v0.5 (Model-kind awareness + reduce “surprising” typing) - DONE
+## v0.5 (Model-kind awareness + reduce "surprising" typing) - DONE
 
 - **Table-model awareness for SQLAlchemy expression typing**
   - Only treat class attributes as SQLAlchemy expressions (e.g. wrap to `InstrumentedAttribute[T]`) for `table=True`
     SQLModel models.
-  - Avoid changing attribute types for “data models” (non-table SQLModel subclasses) used for FastAPI schemas, e.g.
+  - Avoid changing attribute types for "data models" (non-table SQLModel subclasses) used for FastAPI schemas, e.g.
     `TeamBase`, `HeroCreate`, `HeroPublic`.
     - Docs: `https://sqlmodel.tiangolo.com/tutorial/fastapi/relationships/`
 
 - **Pydantic/Field alias & config parity checkpoints**
-  - Verify our generated signatures stay compatible with SQLModel’s `Field(...)` alias behavior (alias propagation
+  - Verify our generated signatures stay compatible with SQLModel's `Field(...)` alias behavior (alias propagation
     and precedence in `validation_alias` / `serialization_alias`).
     - Source: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py` (`Field()` implementation).
   - Document what is supported vs intentionally out of scope when users rely on aliases in constructor kwargs.
@@ -94,20 +94,20 @@ errors for documented patterns.
 - **More query-shape coverage**
   - Multi-entity selects, joins/outer-joins, and relationship-based filters across common SQLModel tutorial patterns.
 - **Document trade-offs (and pick a default strategy)**
-  - Plugin hooks vs stub overlays vs relying purely on SQLAlchemy typing (with “when to use what” guidance).
+  - Plugin hooks vs stub overlays vs relying purely on SQLAlchemy typing (with "when to use what" guidance).
 
 ## v0.8 (Field `sa_type=` supports SQLAlchemy TypeEngine instances) - DONE
 
-**Motivation**: SQLModel’s `Field(sa_type=...)` is a supported API, but real-world usage commonly passes
+**Motivation**: SQLModel's `Field(sa_type=...)` is a supported API, but real-world usage commonly passes
 **instantiated SQLAlchemy types** (e.g. `DateTime(timezone=True)`, `String(50)`), which triggers mypy
 `call-overload` errors under `--strict`. Users currently work around this with `sa_column=Column(...)` or
-`# type: ignore`, which is exactly the “types clutter” we want to remove.
+`# type: ignore`, which is exactly the "types clutter" we want to remove.
 
 - **Fix mypy `call-overload` for `Field(sa_type=<TypeEngine instance>)`**
   - Upstream issue reports:
     - `https://github.com/fastapi/sqlmodel/discussions/955`
     - `https://github.com/fastapi/sqlmodel/discussions/1228`
-  - Upstream pending fix (adjust `sa_type` annotation to match SQLAlchemy’s `Column` type argument rules):
+  - Upstream pending fix (adjust `sa_type` annotation to match SQLAlchemy's `Column` type argument rules):
     - `https://github.com/fastapi/sqlmodel/pull/1345`
   - Source references:
     - SQLModel `Field()` signature: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py`
@@ -122,7 +122,7 @@ errors for documented patterns.
     touching runtime behavior.
 
 - **Tests**
-  - Add a mypy integration module that reproduces the failure in strict mode and asserts it’s fixed without
+  - Add a mypy integration module that reproduces the failure in strict mode and asserts it's fixed without
     `# type: ignore`, e.g.:
     - `Field(sa_type=DateTime(timezone=True))`
     - `Field(sa_type=String(50))`
@@ -133,7 +133,7 @@ errors for documented patterns.
 
 **Motivation**: SQLModel is built on Pydantic v2, and users often want to set things like `extra="forbid"` on
 schema-like models (e.g. `HeroCreate`, `HeroUpdate`) via `model_config = ConfigDict(...)`. Today this can fail mypy
-strict with an “incompatible types in assignment” error (`ConfigDict` vs `SQLModelConfig`), forcing users into
+strict with an "incompatible types in assignment" error (`ConfigDict` vs `SQLModelConfig`), forcing users into
 `# type: ignore` or `cast(...)`.
 
 - **Fix mypy incompatibility for `model_config` overrides**
@@ -148,7 +148,7 @@ strict with an “incompatible types in assignment” error (`ConfigDict` vs `SQ
     so assignment from `ConfigDict(...)` is always accepted.
   - **Plugin adjustment**: during semantic analysis, rewrite the inferred type of `model_config` on SQLModel subclasses
     to a compatible supertype (while keeping runtime untouched).
-  - Ensure we don’t regress table-model behavior: SQLModel uses `model_config["table"]` and `model_config["registry"]`
+  - Ensure we don't regress table-model behavior: SQLModel uses `model_config["table"]` and `model_config["registry"]`
     at runtime (see `SQLModelMetaclass.__new__`).
 
 - **Tests**
@@ -160,8 +160,8 @@ strict with an “incompatible types in assignment” error (`ConfigDict` vs `SQ
 ## v0.10 (`select()` varargs: avoid overload ceiling) - DONE
 
 **Motivation**: SQLModel provides its own typed `select()` overloads, but they are generated only up to **4**
-entities. In real code it’s common to select more than 4 columns/entities (especially with joins/aggregates), which
-can trigger “No overload variant of `select` matches argument types …” even though runtime works.
+entities. In real code it's common to select more than 4 columns/entities (especially with joins/aggregates), which
+can trigger "No overload variant of `select` matches argument types …" even though runtime works.
 
 - **Fix overload ceiling for `sqlmodel.select(...)`**
   - Source reference (generated overloads; note the 4-entity cap):
@@ -171,26 +171,26 @@ can trigger “No overload variant of `select` matches argument types …” eve
     - `https://github.com/fastapi/sqlmodel/issues/271`
 
 - **Implementation options (pick default; document trade-offs)**
-  - **Stub overlay (likely simplest)**: add a final “varargs fallback” overload, e.g.:
+  - **Stub overlay (likely simplest)**: add a final "varargs fallback" overload, e.g.:
     - `@overload`
     - `def select(__ent0: Any, __ent1: Any, __ent2: Any, __ent3: Any, __ent4: Any, *entities: Any) -> Select[tuple[Any, ...]]: ...`
     so mypy always has a matching overload beyond 4 args.
   - **Plugin signature hook**: provide a mypy hook for `sqlmodel.sql.expression.select` that adds the same fallback
     overload, keeping the existing 1–4 entity overload precision.
-  - Optionally, generate more precise overloads (e.g. up to 8) if we’re willing to carry the maintenance cost.
+  - Optionally, generate more precise overloads (e.g. up to 8) if we're willing to carry the maintenance cost.
 
 - **Tests**
   - Add a mypy integration module that selects 5+ entities and asserts no `call-overload` errors under strict mode.
   - Decide and lock down the fallback return type (likely `Select[tuple[Any, ...]]`) to keep behavior predictable.
 
-## v0.11 (SQLAlchemy “extras” coverage + SQLModel `Select` join parity) - DONE
+## v0.11 (SQLAlchemy "extras" coverage + SQLModel `Select` join parity) - DONE
 
 - **Lock down common SQLAlchemy helpers used with SQLModel**
   - `.label(...)` on `table=True` model fields typed as SQLAlchemy expressions.
   - ORM loader options like `selectinload(Model.relationship)` on `table=True` relationships.
   - `Select.execution_options(...)` chaining without losing the `Select[...]` generic (including outer-join `None` propagation).
-- **Fix outer-join `None` propagation for SQLModel’s own `Select` wrapper**
-  - Apply the join/outerjoin return-type adjustment to both SQLAlchemy `Select` and SQLModel’s `sqlmodel.sql._expression_select_cls.Select`.
+- **Fix outer-join `None` propagation for SQLModel's own `Select` wrapper**
+  - Apply the join/outerjoin return-type adjustment to both SQLAlchemy `Select` and SQLModel's `sqlmodel.sql._expression_select_cls.Select`.
 - **Tests**
   - Add/extend mypy integration coverage and commit golden outputs for the new cases.
 
@@ -201,7 +201,7 @@ models do provide this at runtime for `table=True`, but type checkers can miss i
 
 - **Expose and type `__table__` on `table=True` SQLModel models**
   - Provide a plugin-generated `__table__` attribute typed as `sqlalchemy.sql.schema.Table` (with safe fallbacks
-    when stubs don’t expose `Table`).
+    when stubs don't expose `Table`).
 - **Tests**
   - Add mypy integration coverage for `Model.__table__` and `Session.get` / `AsyncSession.get` with SQLModel
     table models.
@@ -230,8 +230,8 @@ signatures (required/optional + alias kwargs) when `Field(...)` metadata lives i
       (`_collect_member_from_stmt`) so class-call signatures stay consistent with generated `__init__`.
   - Source references:
     - SQLModel `Field()` overloads + alias precedence: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py`
-    - `Annotated` handling in SQLModel’s type parsing: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/_compat.py`
-    - Release note: “Fix support for types with `Optional[Annotated[x, f()]]`…” (PR #1093):
+    - `Annotated` handling in SQLModel's type parsing: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/_compat.py`
+    - Release note: "Fix support for types with `Optional[Annotated[x, f()]]`…" (PR #1093):
       `https://github.com/fastapi/sqlmodel/pull/1093`
 
 ## v0.15 (Outer-join `None` propagation for relationship-attribute joins) - DONE
@@ -253,14 +253,14 @@ signatures (required/optional + alias kwargs) when `Field(...)` metadata lives i
 
 ## v0.16 (Strict typing ergonomics add-ons, opt-in) - DONE
 
-**Motivation**: strict typing + SQLModel often means the database populates values “later” (after flush/commit/
-refresh), especially primary keys (`id: int | None`). Mypy can’t infer those runtime effects, and users end up with
+**Motivation**: strict typing + SQLModel often means the database populates values "later" (after flush/commit/
+refresh), especially primary keys (`id: int | None`). Mypy can't infer those runtime effects, and users end up with
 repeated `assert obj.id is not None` (type clutter).
 
 - **Provide a tiny opt-in narrowing helper**
   - Docs context (why `id` starts as `None` and is populated after commit/refresh):
     - `https://sqlmodel.tiangolo.com/tutorial/automatic-id-none-refresh/`
-  - Ship a small helper in this package (runtime-free or near-zero runtime) that helps users narrow “persisted” models
+  - Ship a small helper in this package (runtime-free or near-zero runtime) that helps users narrow "persisted" models
     without `cast(...)`/`# type: ignore`, e.g.:
     - `assert_persisted(obj)` / `require_id(obj)` / `ensure_persisted(obj)` returning a `TypeGuard[...]` or using
       overloads to narrow `id` to `int`.
@@ -286,26 +286,64 @@ for otherwise normal SQLAlchemy patterns.
   - Add a mypy integration module demonstrating composite IN typing without ignores, e.g.:
     - `tuple_(User.id, User.team_id).in_([(1, 2)])`
 
-## v0.18 (Recognize `table=True` via `model_config["table"]`, not just class kwargs) - DONE
+## v0.18 (Comprehensive typing polish) - DONE
 
-**Motivation**: SQLModel’s runtime `is_table_model_class()` checks `model_config.get("table")`, so a class can be a
-table model even when it isn’t declared as `class Model(SQLModel, table=True)`. Today our plugin/transformer only
-looks at the class keyword, so “table-only” behaviors may not activate (expression typing, relationship kwargs in
-constructor signatures, `__table__`, etc.).
+This release consolidates several enhancements to round out SQLModel/mypy strict-mode ergonomics.
 
-- **Detect table models via `model_config` (metadata-driven)**
-  - Extend semantic analysis in `src/sqlmodel_mypy/transform.py` to detect a statically-known class-body assignment like:
-    - `model_config = ConfigDict(table=True)` or equivalent SQLModel config helpers
-  - Persist the result in `TypeInfo.metadata["sqlmodel-mypy-metadata"]`, then update `_is_table_model(...)` in:
-    - `src/sqlmodel_mypy/plugin.py`
-    - `src/sqlmodel_mypy/transform.py`
-    to consult metadata first (then fall back to `table=True` in the class definition).
-  - Source references:
-    - SQLModel metaclass reads config: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py` (`SQLModelMetaclass.__new__`)
-    - SQLModel runtime table detection: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/_compat.py` (`is_table_model_class`)
-- **Tests**
-  - Add mypy integration coverage for a table model enabled via `model_config` and assert the same behavior as
-    `table=True`:
-    - class attribute expression typing (e.g. `User.id.in_([1])`)
-    - constructor accepts relationship kwargs when configured (`init_forbid_extra=true`)
-    - `User.__table__` is typed and present
+### Recognize `table=True` via `model_config["table"]`
+
+SQLModel's runtime `is_table_model_class()` checks `model_config.get("table")`, so a class can be a table model even
+without `class Model(SQLModel, table=True)`.
+
+- Extend semantic analysis in `src/sqlmodel_mypy/transform.py` to detect `model_config = ConfigDict(table=True)`.
+- Persist the result in `TypeInfo.metadata["sqlmodel-mypy-metadata"]`, then update `_is_table_model(...)` in both
+  `plugin.py` and `transform.py` to consult metadata first.
+- Source references:
+  - SQLModel metaclass: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py` (`SQLModelMetaclass.__new__`)
+  - SQLModel runtime table detection: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/_compat.py`
+
+### `select(5+)`: recover tuple element types
+
+v0.10 fixed the overload ceiling by accepting `select(5+)`, but the fallback return type was `Select[tuple[Any, ...]]`.
+
+- Add a best-effort return-type hook that recovers element types from inferred argument expression types.
+- Code: `_sqlmodel_select_signature_callback()`, `_sqlmodel_select_return_type_callback()`, `_sqlmodel_select_entity_result_type()`
+- Tests: `tests/mypy/modules/select_varargs.py`
+
+### Outer-join `None` propagation for aliased/variable join targets
+
+Outer-join `None` propagation previously only worked when the join target was a direct model ref or relationship
+attribute, not when users join via an alias variable (e.g. `team_alias = aliased(Team)`).
+
+- Extend join target type inference to handle typed variables (including `aliased(Model)` results).
+- Code: `_typeinfo_from_join_target_expr()`, `_typeinfo_from_typed_join_target_expr()`, `_typeinfo_from_typed_join_target_type()`
+- Tests: `tests/mypy/modules/aliased_joins.py`
+
+### `getattr(Model, NAME)`: support `Final`/`Literal[...]` names
+
+Dynamic query builders often use constants for attribute names; without this, `getattr(...)` falls back to `Any`.
+
+- Extend `getattr(Model, NAME)` typing beyond string literals by accepting name args typed as string `Literal[...]`
+  (and best-effort `Final` constants where mypy retains the literal).
+- Code: `_sqlmodel_getattr_return_type_callback()`
+- Tests: `tests/mypy/modules/getattr_column_property.py`
+
+### `Field(validation_alias=...)`: Pydantic v2 alias parity
+
+Pydantic v2 supports `validation_alias=AliasPath(...)` / `AliasChoices(...)`, but SQLModel's `Field(...)` typing is
+narrower; strict mypy users otherwise need `cast(...)`/`# type: ignore`.
+
+- Widen `Field(validation_alias=...)` to accept `pydantic.aliases.AliasPath | AliasChoices` (idempotent if upstream
+  is already widened).
+- Code: `_sqlmodel_field_signature_callback()`
+- Tests: `tests/mypy/modules/field_validation_alias.py`
+
+### Optional typed `Session.execute()` / `AsyncSession.execute()`
+
+SQLModel overrides `execute()` and types it as `Result[Any]`, shadowing SQLAlchemy's typed overloads. Even though
+`execute()` is deprecated in SQLModel docs, users still rely on it during migrations.
+
+- Add an opt-in mypy plugin behavior that types `execute(select(...))` as `Result[...]` (and preserves async wrapping).
+- Config: `typed_execute = true` under `[sqlmodel-mypy]`
+- Code: `SQLModelPluginConfig.typed_execute`, `_sqlmodel_session_execute_return_type_callback()`, `_row_tuple_type_from_typed_statement()`
+- Tests: `tests/mypy/configs/mypy-plugin-strict-typed-execute.ini`, `tests/mypy/modules/session_execute_typed.py`

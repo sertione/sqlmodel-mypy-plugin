@@ -9,6 +9,7 @@ from mypy.nodes import (
     ARG_NAMED_OPT,
     ARG_OPT,
     ARG_POS,
+    ARG_STAR,
     ARG_STAR2,
     Block,
     CallExpr,
@@ -36,7 +37,9 @@ from mypy.types import (
     AnyType,
     CallableType,
     Instance,
+    LiteralType,
     NoneType,
+    Overloaded,
     TupleType,
     Type,
     TypeOfAny,
@@ -221,6 +224,7 @@ def test_plugin_config_defaults_when_no_config_file() -> None:
     assert cfg.init_typed is False
     assert cfg.init_forbid_extra is False
     assert cfg.warn_untyped_fields is True
+    assert cfg.typed_execute is False
     assert cfg.debug_dataclass_transform is False
 
 
@@ -232,6 +236,7 @@ def test_plugin_config_reads_toml(tmp_path: Path) -> None:
 init_typed = true
 init_forbid_extra = true
 warn_untyped_fields = false
+typed_execute = true
 debug_dataclass_transform = true
 """.lstrip()
     )
@@ -242,6 +247,7 @@ debug_dataclass_transform = true
     assert cfg.init_typed is True
     assert cfg.init_forbid_extra is True
     assert cfg.warn_untyped_fields is False
+    assert cfg.typed_execute is True
     assert cfg.debug_dataclass_transform is True
 
 
@@ -268,6 +274,7 @@ def test_plugin_config_reads_ini(tmp_path: Path) -> None:
 init_typed = true
 init_forbid_extra = false
 warn_untyped_fields = false
+typed_execute = true
 debug_dataclass_transform = true
 """.lstrip()
     )
@@ -278,6 +285,7 @@ debug_dataclass_transform = true
     assert cfg.init_typed is True
     assert cfg.init_forbid_extra is False
     assert cfg.warn_untyped_fields is False
+    assert cfg.typed_execute is True
     assert cfg.debug_dataclass_transform is True
 
 
@@ -572,6 +580,76 @@ def test_select_signature_hook_supports_more_than_4_entities() -> None:
     assert len(row.items) == 5
 
 
+def test_select_return_type_callback_recovers_tuple_item_types_for_5plus() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    hero_info = make_typeinfo("m.Hero")
+    team_info = make_typeinfo("m.Team")
+    select_info = make_typeinfo(plugin_mod.SQLMODEL_SELECT_CLS_FULLNAME)
+
+    any_t = AnyType(TypeOfAny.explicit)
+    tuple_info = make_typeinfo("builtins.tuple")
+    tuple_fallback = Instance(tuple_info, [any_t])
+    default_row = TupleType([any_t, any_t, any_t, any_t, any_t], tuple_fallback)
+    default_return = Instance(select_info, [default_row])
+
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+    str_t = Instance(make_typeinfo("builtins.str"), [])
+
+    inst_attr_int = Instance(
+        make_typeinfo("sqlalchemy.orm.attributes.InstrumentedAttribute"), [int_t]
+    )
+    inst_attr_str = Instance(
+        make_typeinfo("sqlalchemy.orm.attributes.InstrumentedAttribute"), [str_t]
+    )
+
+    call = CallExpr(
+        NameExpr("select"),
+        [
+            NameExpr("Hero"),
+            NameExpr("Team"),
+            NameExpr("HeroId"),
+            NameExpr("TeamId"),
+            NameExpr("HeroName"),
+        ],
+        [ARG_POS, ARG_POS, ARG_POS, ARG_POS, ARG_POS],
+        [None, None, None, None, None],
+    )
+    ctx = FunctionContext(
+        arg_types=[
+            [TypeType(Instance(hero_info, []))],
+            [TypeType(Instance(team_info, []))],
+            [inst_attr_int],
+            [inst_attr_int],
+            [inst_attr_str],
+        ],
+        arg_kinds=[[ARG_POS], [ARG_POS], [ARG_POS], [ARG_POS], [ARG_POS]],
+        callee_arg_names=["__ent0", "__ent1", "__ent2", "__ent3", "__ent4"],
+        arg_names=[[None], [None], [None], [None], [None]],
+        default_return_type=default_return,
+        args=[],
+        context=call,
+        api=api,
+    )
+    out = p._sqlmodel_select_return_type_callback(ctx)
+    proper = get_proper_type(out)
+    assert isinstance(proper, Instance)
+    assert proper.type.fullname == plugin_mod.SQLMODEL_SELECT_CLS_FULLNAME
+    assert proper.args
+    row = get_proper_type(proper.args[0])
+    assert isinstance(row, TupleType)
+    assert len(row.items) == 5
+    assert isinstance(get_proper_type(row.items[0]), Instance)
+    assert get_proper_type(row.items[0]).type.fullname == "m.Hero"  # type: ignore[union-attr]
+    assert isinstance(get_proper_type(row.items[1]), Instance)
+    assert get_proper_type(row.items[1]).type.fullname == "m.Team"  # type: ignore[union-attr]
+    assert isinstance(get_proper_type(row.items[2]), Instance)
+    assert get_proper_type(row.items[2]).type.fullname == "builtins.int"  # type: ignore[union-attr]
+    assert isinstance(get_proper_type(row.items[4]), Instance)
+    assert get_proper_type(row.items[4]).type.fullname == "builtins.str"  # type: ignore[union-attr]
+
+
 def test_select_join_isouter_true_makes_joined_entity_optional_in_return_type() -> None:
     p = plugin_mod.SQLModelMypyPlugin(Options())
 
@@ -626,6 +704,20 @@ def test_select_join_isouter_true_makes_joined_entity_optional_in_return_type() 
     second = get_proper_type(tp2.items[1])
     assert isinstance(second, UnionType)
     assert any(isinstance(get_proper_type(it), NoneType) for it in second.items)
+
+
+def test_typeinfo_from_join_target_expr_supports_typed_variables() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    team_info = make_typeinfo("m.Team")
+    alias_var = Var("team_alias")
+    alias_var.type = TypeType(Instance(team_info, []))
+
+    expr = NameExpr("team_alias")
+    expr.node = alias_var
+
+    assert p._typeinfo_from_join_target_expr(expr, api) is team_info
 
 
 def test_select_join_isouter_true_with_relationship_target_makes_joined_entity_optional_in_return_type() -> (
@@ -1441,6 +1533,76 @@ def test_getattr_function_hook_types_sqlmodel_table_members() -> None:
     assert t.args and isinstance(get_proper_type(t.args[0]), Instance)
 
 
+def test_getattr_function_hook_supports_literal_name_type() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    model_info = make_sqlmodel_class("m.User")
+    model_info.defn.keywords["table"] = NameExpr("True")
+    model_info.metadata[plugin_mod.METADATA_KEY] = {
+        "fields": {"id": {}, "name": {}},
+        "relationships": {},
+    }
+
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+    str_t = Instance(make_typeinfo("builtins.str"), [])
+    model_info.names["id"] = SymbolTableNode(0, Var("id", int_t))
+    model_info.names["name"] = SymbolTableNode(0, Var("name", str_t))
+
+    user_type = TypeType(Instance(model_info, []))
+    name_type = LiteralType("id", Instance(make_typeinfo("builtins.str"), []))
+    ctx = FunctionContext(
+        arg_types=[[user_type], [name_type]],
+        arg_kinds=[[ARG_POS], [ARG_POS]],
+        callee_arg_names=["object", "name"],
+        arg_names=[[None], [None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("User")], [NameExpr("FIELD")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+
+    t = p._sqlmodel_getattr_return_type_callback(ctx)
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "sqlalchemy.orm.attributes.InstrumentedAttribute"
+
+
+def test_getattr_function_hook_unions_literal_name_types() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    model_info = make_sqlmodel_class("m.User")
+    model_info.defn.keywords["table"] = NameExpr("True")
+    model_info.metadata[plugin_mod.METADATA_KEY] = {
+        "fields": {"id": {}, "name": {}},
+        "relationships": {},
+    }
+
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+    str_t = Instance(make_typeinfo("builtins.str"), [])
+    model_info.names["id"] = SymbolTableNode(0, Var("id", int_t))
+    model_info.names["name"] = SymbolTableNode(0, Var("name", str_t))
+
+    user_type = TypeType(Instance(model_info, []))
+    lit_id = LiteralType("id", Instance(make_typeinfo("builtins.str"), []))
+    lit_name = LiteralType("name", Instance(make_typeinfo("builtins.str"), []))
+    name_type = UnionType.make_union([lit_id, lit_name])
+
+    ctx = FunctionContext(
+        arg_types=[[user_type], [name_type]],
+        arg_kinds=[[ARG_POS], [ARG_POS]],
+        callee_arg_names=["object", "name"],
+        arg_names=[[None], [None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("User")], [NameExpr("FIELD")]],
+        context=NameExpr("x"),
+        api=api,
+    )
+
+    t = p._sqlmodel_getattr_return_type_callback(ctx)
+    assert isinstance(get_proper_type(t), UnionType)
+
+
 def test_getattr_function_hook_handles_table_dunder_table() -> None:
     p = plugin_mod.SQLModelMypyPlugin(Options())
     api = DummyCheckerAPI()
@@ -2249,3 +2411,533 @@ def test_metaclass_callback_handles_missing_declared_metaclass() -> None:
     p = plugin_mod.SQLModelMypyPlugin(Options())
     ctx = SimpleNamespace(cls=SimpleNamespace(info=SimpleNamespace(declared_metaclass=None)))
     p._sqlmodel_metaclass_callback(ctx)  # type: ignore[arg-type]
+
+
+def test_field_signature_hook_widens_validation_alias_and_sa_type() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    type_engine_info = make_typeinfo("sqlalchemy.sql.type_api.TypeEngine")
+    alias_path_info = make_typeinfo("pydantic.aliases.AliasPath")
+    alias_choices_info = make_typeinfo("pydantic.aliases.AliasChoices")
+    lookup_map = {
+        type_engine_info.fullname: type_engine_info,
+        alias_path_info.fullname: alias_path_info,
+        alias_choices_info.fullname: alias_choices_info,
+    }
+    p.lookup_fully_qualified = (  # type: ignore[method-assign]
+        lambda full: SimpleNamespace(node=lookup_map[full]) if full in lookup_map else None
+    )
+
+    old_sa_type = Instance(make_typeinfo("builtins.type"), [])
+    old_validation_alias = UnionType.make_union(
+        [Instance(make_typeinfo("builtins.str"), []), NoneType()]
+    )
+    default_sig = CallableType(
+        [old_sa_type, old_validation_alias],
+        [ARG_OPT, ARG_OPT],
+        ["sa_type", "validation_alias"],
+        AnyType(TypeOfAny.explicit),
+        Instance(make_typeinfo("builtins.function"), []),
+    )
+    out = p._sqlmodel_field_signature_callback(
+        FunctionSigContext(
+            args=[], default_signature=default_sig, context=NameExpr("x"), api=DummyCheckerAPI()
+        )
+    )
+    assert isinstance(out, CallableType)
+    assert out is not default_sig
+
+    sa_type_arg = get_proper_type(out.arg_types[0])
+    assert isinstance(sa_type_arg, UnionType)
+    assert any(
+        isinstance(get_proper_type(it), Instance)
+        and get_proper_type(it).type.fullname == "sqlalchemy.sql.type_api.TypeEngine"  # type: ignore[union-attr]
+        for it in sa_type_arg.items
+    )
+
+    validation_alias_arg = get_proper_type(out.arg_types[1])
+    assert isinstance(validation_alias_arg, UnionType)
+    assert any(
+        isinstance(get_proper_type(it), Instance)
+        and get_proper_type(it).type.fullname == "pydantic.aliases.AliasPath"  # type: ignore[union-attr]
+        for it in validation_alias_arg.items
+    )
+    assert any(
+        isinstance(get_proper_type(it), Instance)
+        and get_proper_type(it).type.fullname == "pydantic.aliases.AliasChoices"  # type: ignore[union-attr]
+        for it in validation_alias_arg.items
+    )
+
+
+def test_session_execute_method_hook_types_select_results_when_enabled() -> None:
+    options = Options()
+    options.config_file = None
+    p = plugin_mod.SQLModelMypyPlugin(options)
+    p.plugin_config.typed_execute = True
+
+    api = DummyCheckerAPI()
+    hero_info = make_typeinfo("m.Hero")
+
+    # `select(Hero)` is typically a SelectOfScalar[Hero].
+    select_scalar_info = make_typeinfo(plugin_mod.SQLMODEL_SELECT_OF_SCALAR_CLS_FULLNAME)
+    stmt = Instance(select_scalar_info, [Instance(hero_info, [])])
+
+    call = CallExpr(NameExpr("execute"), [NameExpr("stmt")], [ARG_POS], [None])
+    ctx = MethodContext(
+        type=Instance(make_typeinfo("sqlmodel.orm.session.Session"), []),
+        arg_types=[[stmt]],
+        arg_kinds=[[ARG_POS]],
+        callee_arg_names=["statement"],
+        arg_names=[[None]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[NameExpr("stmt")]],
+        context=call,
+        api=api,
+    )
+    t = p._sqlmodel_session_execute_return_type_callback(ctx, is_async=False)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    assert proper.type.fullname == "sqlalchemy.engine.Result"
+    assert proper.args
+    row = get_proper_type(proper.args[0])
+    assert isinstance(row, TupleType)
+    assert len(row.items) == 1
+
+    # Async wrapper: preserve Coroutine[T] and only swap the inner result type.
+    default_coro = Instance(
+        make_typeinfo("typing.Coroutine"),
+        [AnyType(TypeOfAny.explicit), AnyType(TypeOfAny.explicit), AnyType(TypeOfAny.explicit)],
+    )
+    ctx_async = MethodContext(
+        type=Instance(make_typeinfo("sqlmodel.ext.asyncio.session.AsyncSession"), []),
+        arg_types=[[stmt]],
+        arg_kinds=[[ARG_POS]],
+        callee_arg_names=["statement"],
+        arg_names=[[None]],
+        default_return_type=default_coro,
+        args=[[NameExpr("stmt")]],
+        context=call,
+        api=api,
+    )
+    t2 = p._sqlmodel_session_execute_return_type_callback(ctx_async, is_async=True)
+    proper2 = get_proper_type(t2)
+    assert isinstance(proper2, Instance)
+    assert proper2.type.fullname == "typing.Coroutine"
+    assert len(proper2.args) == 3
+    inner = get_proper_type(proper2.args[2])
+    assert isinstance(inner, Instance)
+    assert inner.type.fullname == "sqlalchemy.engine.Result"
+
+
+def test_call_get_positional_returns_none_for_out_of_range() -> None:
+    call = CallExpr(NameExpr("f"), [NameExpr("x")], [ARG_POS], [None])
+    assert plugin_mod._call_get_positional(call, 1) is None
+
+
+def test_typeinfo_from_ref_expr_none_and_non_typeinfo() -> None:
+    assert plugin_mod._typeinfo_from_ref_expr(None) is None
+
+    expr = NameExpr("x")
+    expr.node = Var("x")
+    assert plugin_mod._typeinfo_from_ref_expr(expr) is None
+
+
+def test_named_type_helpers_return_none_when_api_missing_methods() -> None:
+    int_t = Instance(make_typeinfo("builtins.int"), [])
+
+    class EmptyAPI:
+        pass
+
+    assert plugin_mod._named_type_or_none(EmptyAPI(), "builtins.int") is None
+    assert plugin_mod._named_generic_type_or_none(EmptyAPI(), "builtins.list", [int_t]) is None
+
+
+def test_plugins_from_config_file_returns_none_for_invalid_shapes(tmp_path: Path) -> None:
+    # TOML with unsupported plugins shape.
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        """
+[tool.mypy]
+plugins = 1
+""".lstrip()
+    )
+    assert plugin_mod._plugins_from_config_file(str(path)) is None
+
+    # INI without [mypy] section.
+    ini1 = tmp_path / "no-mypy.ini"
+    ini1.write_text(
+        """
+[sqlmodel-mypy]
+init_typed = true
+""".lstrip()
+    )
+    assert plugin_mod._plugins_from_config_file(str(ini1)) is None
+
+    # INI with [mypy] but without plugins option.
+    ini2 = tmp_path / "no-plugins.ini"
+    ini2.write_text(
+        """
+[mypy]
+strict = true
+""".lstrip()
+    )
+    assert plugin_mod._plugins_from_config_file(str(ini2)) is None
+
+
+def test_warm_sqlalchemy_typing_is_idempotent_and_skips_exceptions() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    class RaisingNamedTypeAPI:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def named_type(self, fullname: str, args: list[Type] | None = None) -> Instance:
+            self.calls.append(fullname)
+            if fullname == "builtins.bool":
+                return Instance(make_typeinfo("builtins.bool"), [])
+            raise RuntimeError("boom")
+
+    api = RaisingNamedTypeAPI()
+    p._warm_sqlalchemy_typing(api)  # should swallow exceptions in the loop
+    assert p._warmed_sqlalchemy_typing is True
+
+    # Second call is a no-op.
+    before = len(api.calls)
+    p._warm_sqlalchemy_typing(api)
+    assert len(api.calls) == before
+
+
+def test_declares_sqlmodel_member_accepts_relationship_list_metadata() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    info = make_sqlmodel_class("m.User")
+    info.metadata[plugin_mod.METADATA_KEY] = {"fields": {}, "relationships": ["team"]}
+    assert p._declares_sqlmodel_member(info, "team") is True
+
+
+def test_get_method_hook_returns_execute_hook_when_enabled() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    p.plugin_config.typed_execute = True
+    assert p.get_method_hook(plugin_mod.SQLMODEL_SESSION_EXECUTE_FULLNAME) is not None
+    assert p.get_method_hook(plugin_mod.SQLMODEL_ASYNC_SESSION_EXECUTE_FULLNAME) is not None
+
+
+def test_get_function_hook_returns_select_hook() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    assert p.get_function_hook(plugin_mod.SQLMODEL_SELECT_GEN_FULLNAME) is not None
+
+
+def test_session_execute_callback_supports_statement_keyword_argument() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    p.plugin_config.typed_execute = True
+    api = DummyCheckerAPI()
+
+    hero_info = make_typeinfo("m.Hero")
+    select_scalar_info = make_typeinfo(plugin_mod.SQLMODEL_SELECT_OF_SCALAR_CLS_FULLNAME)
+    stmt = Instance(select_scalar_info, [Instance(hero_info, [])])
+
+    stmt_expr = NameExpr("stmt")
+    call = CallExpr(NameExpr("execute"), [stmt_expr], [ARG_NAMED], ["statement"])
+    ctx = MethodContext(
+        type=Instance(make_typeinfo("sqlmodel.orm.session.Session"), []),
+        arg_types=[[stmt]],
+        arg_kinds=[[ARG_NAMED]],
+        callee_arg_names=["statement"],
+        arg_names=[["statement"]],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[[stmt_expr]],
+        context=call,
+        api=api,
+    )
+    t = p._sqlmodel_session_execute_return_type_callback(ctx, is_async=False)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    assert proper.type.fullname == "sqlalchemy.engine.Result"
+
+
+def test_sqlalchemy_result_type_falls_back_to_lookup_without_named_generic() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    result_info = make_typeinfo("sqlalchemy.engine.Result")
+    p.lookup_fully_qualified = (  # type: ignore[method-assign]
+        lambda full: SimpleNamespace(node=result_info) if full == result_info.fullname else None
+    )
+
+    class NoGenericAPI:
+        def named_type(self, fullname: str, args: list[Type] | None = None) -> Instance:  # noqa: D401
+            raise RuntimeError("no named_type support")
+
+    api = NoGenericAPI()
+    any_t = AnyType(TypeOfAny.explicit)
+    row = TupleType(
+        [Instance(make_typeinfo("builtins.int"), [])],
+        Instance(make_typeinfo("builtins.tuple"), [any_t]),
+    )
+    t = p._sqlalchemy_result_type(api, row)
+    assert isinstance(t, Instance)
+    assert t.type.fullname == "sqlalchemy.engine.Result"
+
+
+def test_row_tuple_type_from_typed_statement_returns_none_for_non_select() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+    stmt = Instance(
+        make_typeinfo("sqlalchemy.sql.elements.ColumnElement"), [AnyType(TypeOfAny.explicit)]
+    )
+    assert p._row_tuple_type_from_typed_statement(stmt, api) is None
+
+
+def test_collect_members_for_signature_skips_none_members_and_collects_inherited_relationships() -> (
+    None
+):
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    sqlmodel_info = make_typeinfo(plugin_mod.SQLMODEL_BASEMODEL_FULLNAME)
+    obj_info = make_typeinfo("builtins.object")
+
+    base_info = make_typeinfo("m.Base")
+    base_info.mro = [base_info, sqlmodel_info, obj_info]
+
+    user_info = make_typeinfo("m.User")
+    user_info.mro = [user_info, base_info, sqlmodel_info, obj_info]
+
+    # Inherited statement that's ignored -> `continue` branch.
+    stmt_base_cfg = plugin_mod.AssignmentStmt([NameExpr("model_config")], NameExpr("x"))
+    stmt_base_cfg.new_syntax = True
+    base_info.defn.defs.body.append(stmt_base_cfg)
+
+    # Inherited relationship with a known type so map_type_from_supertype runs.
+    team_info = make_typeinfo("m.Team")
+    team_t = Instance(team_info, [])
+    rel_t = UnionType.make_union([team_t, NoneType()])
+    base_info.names["team"] = SymbolTableNode(0, Var("team", rel_t))
+    stmt_base_rel = plugin_mod.AssignmentStmt(
+        [NameExpr("team")], make_call(plugin_mod.SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_base_rel.new_syntax = True
+    base_info.defn.defs.body.append(stmt_base_rel)
+
+    # Current-class ignored statement -> `continue` branch.
+    stmt_user_cfg = plugin_mod.AssignmentStmt([NameExpr("model_config")], NameExpr("x"))
+    stmt_user_cfg.new_syntax = True
+    user_info.defn.defs.body.append(stmt_user_cfg)
+
+    fields, rels = p._collect_members_for_signature(user_info, api)
+    assert fields == []
+    assert [r.name for r in rels] == ["team"]
+
+
+def test_constructor_signature_callback_uses_decorator_wrapped_init_type() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+
+    info = make_sqlmodel_class("m.User")
+    init_sig = CallableType(
+        [AnyType(TypeOfAny.explicit), Instance(make_typeinfo("builtins.int"), [])],
+        [ARG_POS, ARG_NAMED],
+        [None, "x"],
+        NoneType(),
+        Instance(make_typeinfo("builtins.function"), []),
+    )
+    init_func = FuncDef("__init__", arguments=[], body=Block([]))
+    init_func.type = init_sig
+    init_var = Var("__init__")
+    init_node = plugin_mod.Decorator(init_func, decorators=[], var=init_var)
+
+    sym = SymbolTableNode(0, init_node)
+    sym.plugin_generated = True  # type: ignore[attr-defined]
+    info.names["__init__"] = sym
+
+    default_sig = CallableType(
+        [], [], [], Instance(info, []), Instance(make_typeinfo("builtins.function"), [])
+    )
+    ctx = FunctionSigContext(args=[], default_signature=default_sig, context=NameExpr("x"), api=api)
+    out = p._sqlmodel_constructor_signature_callback(ctx, info)
+    assert isinstance(out, CallableType)
+    # Drop `self` from the init signature.
+    assert out.arg_names == ["x"]
+
+
+def test_constructor_signature_callback_dedupes_field_aliases_and_types_relationship_kwargs() -> (
+    None
+):
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    p.plugin_config.init_typed = True
+    api = DummyCheckerAPI()
+
+    info = make_sqlmodel_class("m.User")
+    info.defn.keywords["table"] = NameExpr("True")
+    info.metadata[plugin_mod.METADATA_KEY] = {
+        "fields": {
+            "a": {"aliases": ["x"], "has_default": False},
+            "b": {"aliases": ["x"], "has_default": False},
+        },
+        "relationships": {},
+    }
+
+    info.names["a"] = SymbolTableNode(0, Var("a", Instance(make_typeinfo("builtins.int"), [])))
+    info.names["b"] = SymbolTableNode(0, Var("b", Instance(make_typeinfo("builtins.str"), [])))
+
+    stmt_a = plugin_mod.AssignmentStmt(
+        [NameExpr("a")], make_call(plugin_mod.SQLMODEL_FIELD_FULLNAME)
+    )
+    stmt_a.new_syntax = True
+    info.defn.defs.body.append(stmt_a)
+
+    stmt_b = plugin_mod.AssignmentStmt(
+        [NameExpr("b")], make_call(plugin_mod.SQLMODEL_FIELD_FULLNAME)
+    )
+    stmt_b.new_syntax = True
+    info.defn.defs.body.append(stmt_b)
+
+    # Relationship with unknown type -> should be `Any` in typed signatures.
+    stmt_rel = plugin_mod.AssignmentStmt(
+        [NameExpr("team")], make_call(plugin_mod.SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_rel.new_syntax = True
+    info.defn.defs.body.append(stmt_rel)
+
+    default_sig = CallableType(
+        [], [], [], Instance(info, []), Instance(make_typeinfo("builtins.function"), [])
+    )
+    ctx = FunctionSigContext(args=[], default_signature=default_sig, context=NameExpr("x"), api=api)
+    out = p._sqlmodel_constructor_signature_callback(ctx, info)
+    assert isinstance(out, CallableType)
+
+    # Alias `x` should appear only once, even if multiple fields share it.
+    assert out.arg_names.count("x") == 1
+    assert "team" in out.arg_names
+
+
+def test_get_method_hook_registers_outerjoin_from() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    assert p.get_method_hook(plugin_mod.SQLALCHEMY_SELECT_OUTERJOIN_FROM_FULLNAME) is not None
+    assert p.get_method_hook(plugin_mod.SQLMODEL_SELECT_OUTERJOIN_FROM_FULLNAME) is not None
+
+
+def test_select_signature_hook_returns_default_for_non_call_context() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    hook = p.get_function_signature_hook(plugin_mod.SQLMODEL_SELECT_GEN_FULLNAME)
+    assert hook is not None
+
+    default_sig = CallableType(
+        [], [], [], AnyType(TypeOfAny.explicit), Instance(make_typeinfo("builtins.function"), [])
+    )
+    api = DummyCheckerAPI()
+    assert (
+        hook(
+            FunctionSigContext(
+                args=[], default_signature=default_sig, context=NameExpr("x"), api=api
+            )
+        )
+        is default_sig
+    )
+
+
+def test_select_signature_hook_returns_default_for_star_args() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    hook = p.get_function_signature_hook(plugin_mod.SQLMODEL_SELECT_GEN_FULLNAME)
+    assert hook is not None
+
+    default_sig = CallableType(
+        [], [], [], AnyType(TypeOfAny.explicit), Instance(make_typeinfo("builtins.function"), [])
+    )
+    call = CallExpr(NameExpr("select"), [NameExpr("xs")], [ARG_STAR], [None])
+    api = DummyCheckerAPI()
+    assert (
+        hook(FunctionSigContext(args=[], default_signature=default_sig, context=call, api=api))
+        is default_sig
+    )
+
+
+def test_select_signature_hook_returns_default_for_named_args() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    hook = p.get_function_signature_hook(plugin_mod.SQLMODEL_SELECT_GEN_FULLNAME)
+    assert hook is not None
+
+    default_sig = CallableType(
+        [], [], [], AnyType(TypeOfAny.explicit), Instance(make_typeinfo("builtins.function"), [])
+    )
+    call = CallExpr(NameExpr("select"), [NameExpr("x")], [ARG_NAMED], ["entity_0"])
+    api = DummyCheckerAPI()
+    assert (
+        hook(FunctionSigContext(args=[], default_signature=default_sig, context=call, api=api))
+        is default_sig
+    )
+
+
+def test_select_signature_hook_returns_default_for_non_positional_kinds() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    hook = p.get_function_signature_hook(plugin_mod.SQLMODEL_SELECT_GEN_FULLNAME)
+    assert hook is not None
+
+    default_sig = CallableType(
+        [], [], [], AnyType(TypeOfAny.explicit), Instance(make_typeinfo("builtins.function"), [])
+    )
+    call = CallExpr(NameExpr("select"), [NameExpr("x")], [ARG_OPT], [None])
+    api = DummyCheckerAPI()
+    assert (
+        hook(FunctionSigContext(args=[], default_signature=default_sig, context=call, api=api))
+        is default_sig
+    )
+
+
+def test_field_signature_hook_handles_missing_validation_alias_param() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    default_sig = CallableType(
+        [AnyType(TypeOfAny.explicit)],
+        [ARG_OPT],
+        ["sa_type"],
+        AnyType(TypeOfAny.explicit),
+        Instance(make_typeinfo("builtins.function"), []),
+    )
+    out = p._sqlmodel_field_signature_callback(
+        FunctionSigContext(
+            args=[], default_signature=default_sig, context=NameExpr("x"), api=DummyCheckerAPI()
+        )
+    )
+    assert out is default_sig
+
+
+def test_field_signature_hook_returns_default_for_overloaded_signature() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    sig_item = CallableType(
+        [],
+        [],
+        [],
+        AnyType(TypeOfAny.explicit),
+        Instance(make_typeinfo("builtins.function"), []),
+    )
+    default_sig = Overloaded([sig_item])
+    out = p._sqlmodel_field_signature_callback(
+        FunctionSigContext(
+            args=[], default_signature=default_sig, context=NameExpr("x"), api=DummyCheckerAPI()
+        )
+    )
+    assert out is default_sig
+
+
+def test_select_signature_hook_is_idempotent_for_star_overload() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    hook = p.get_function_signature_hook(plugin_mod.SQLMODEL_SELECT_GEN_FULLNAME)
+    assert hook is not None
+
+    default_sig = CallableType(
+        [AnyType(TypeOfAny.explicit), AnyType(TypeOfAny.explicit)],
+        [ARG_POS, ARG_STAR],
+        [None, None],
+        AnyType(TypeOfAny.explicit),
+        Instance(make_typeinfo("builtins.function"), []),
+    )
+    call = CallExpr(
+        NameExpr("select"),
+        [NameExpr("a"), NameExpr("b"), NameExpr("c"), NameExpr("d"), NameExpr("e")],
+        [ARG_POS, ARG_POS, ARG_POS, ARG_POS, ARG_POS],
+        [None, None, None, None, None],
+    )
+    api = DummyCheckerAPI()
+    assert (
+        hook(FunctionSigContext(args=[], default_signature=default_sig, context=call, api=api))
+        is default_sig
+    )
