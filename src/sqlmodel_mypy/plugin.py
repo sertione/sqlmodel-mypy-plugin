@@ -85,6 +85,10 @@ ERROR_PLUGIN_ORDER = ErrorCode(
 BUILTINS_GETATTR_FULLNAME = "builtins.getattr"
 
 SQLMODEL_COL_FULLNAME = "sqlmodel.sql.expression.col"
+SQLMODEL_TUPLE_FULLNAMES = {
+    "sqlmodel.sql.expression.tuple_",
+    "sqlmodel.tuple_",  # re-export
+}
 # SQLModel's `select()` is implemented in a generated module and re-exported.
 SQLMODEL_SELECT_GEN_FULLNAME = "sqlmodel.sql._expression_select_gen.select"
 SQLMODEL_SELECT_FULLNAMES = {
@@ -154,7 +158,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 20
+__version__ = 21
 
 
 class _CollectedField(NamedTuple):
@@ -367,6 +371,7 @@ class SQLModelMypyPlugin(Plugin):
             ("sqlalchemy.orm.base.Mapped", [any_t]),
             ("sqlalchemy.orm.Mapped", [any_t]),
             ("sqlalchemy.sql.elements.ColumnElement", [bool_t]),
+            ("sqlalchemy.sql.elements.Tuple", None),
             ("sqlalchemy.sql.schema.Table", None),
             ("sqlalchemy.sql.schema.TableClause", None),
             ("sqlalchemy.sql.selectable.FromClause", None),
@@ -387,6 +392,8 @@ class SQLModelMypyPlugin(Plugin):
             return self._sqlmodel_field_signature_callback
         if fullname in SQLMODEL_SELECT_FULLNAMES:
             return self._sqlmodel_select_signature_callback
+        if fullname in SQLMODEL_TUPLE_FULLNAMES:
+            return self._sqlmodel_tuple_signature_callback
 
         info = _lookup_typeinfo(self, fullname)
         if info is None:
@@ -483,6 +490,8 @@ class SQLModelMypyPlugin(Plugin):
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
         if fullname == SQLMODEL_COL_FULLNAME:
             return self._sqlmodel_col_return_type_callback
+        if fullname in SQLMODEL_TUPLE_FULLNAMES:
+            return self._sqlmodel_tuple_return_type_callback
         if fullname == BUILTINS_GETATTR_FULLNAME:
             return self._sqlmodel_getattr_return_type_callback
         if fullname in SQLALCHEMY_COLUMN_PROPERTY_FULLNAMES:
@@ -874,6 +883,72 @@ class SQLModelMypyPlugin(Plugin):
         arg_kinds: list[ArgKind] = [ARG_POS] * positional_count
         arg_names = [f"__ent{i}" for i in range(positional_count)]
         return CallableType(arg_types, arg_kinds, arg_names, ret_type, fallback)
+
+    def _sqlalchemy_tuple_expr_type(self, api: Any | None = None) -> Type:
+        """Return the best available SQLAlchemy tuple expression type.
+
+        Prefer `sqlalchemy.sql.elements.Tuple`, but fall back to `ColumnElement[tuple[Any, ...]]`
+        if SQLAlchemy's stubs/types are missing the concrete `Tuple` class.
+        """
+        for fullname in ("sqlalchemy.sql.elements.Tuple", "sqlalchemy.sql.expression.Tuple"):
+            if api is not None:
+                inst = _named_type_or_none(api, fullname)
+                if inst is not None:
+                    return inst
+            info = _lookup_typeinfo(self, fullname)
+            if info is not None:
+                return Instance(info, [])
+
+        any_t = _plugin_any()
+        tuple_any = (
+            _named_generic_type_or_none(api, "builtins.tuple", [any_t]) if api is not None else None
+        )
+        if tuple_any is None:
+            tuple_info = _lookup_typeinfo(self, "builtins.tuple")
+            if tuple_info is not None:
+                tuple_args = [any_t] * len(tuple_info.defn.type_vars)
+                tuple_any = Instance(tuple_info, tuple_args)
+        if tuple_any is None:
+            return _plugin_any()
+
+        for fullname in (
+            "sqlalchemy.sql.elements.ColumnElement",
+            "sqlalchemy.sql.expression.ColumnElement",
+        ):
+            if api is not None:
+                inst = _named_generic_type_or_none(api, fullname, [tuple_any])
+                if inst is not None:
+                    return inst
+            info = _lookup_typeinfo(self, fullname)
+            if info is not None:
+                col_args = [tuple_any] * len(info.defn.type_vars)
+                return Instance(info, col_args)
+        return _plugin_any()
+
+    def _sqlmodel_tuple_signature_callback(self, ctx: FunctionSigContext) -> FunctionLike:
+        """Type `sqlmodel.tuple_(...)` as a SQLAlchemy tuple expression.
+
+        SQLModel currently annotates `tuple_` as returning a Python `tuple[Any, ...]`, but
+        SQLAlchemy's `tuple_()` returns an expression object that supports methods like `.in_(...)`.
+        """
+        default = ctx.default_signature
+        if not isinstance(default, CallableType):
+            return default
+
+        proper_default = get_proper_type(default.ret_type)
+        if isinstance(proper_default, Instance):
+            if proper_default.type.fullname == "sqlalchemy.sql.elements.Tuple":
+                return default
+            if proper_default.type.fullname in {
+                "sqlalchemy.sql.elements.ColumnElement",
+                "sqlalchemy.sql.expression.ColumnElement",
+            }:
+                return default
+
+        ret_type = self._sqlalchemy_tuple_expr_type(ctx.api)
+        if ret_type == default.ret_type:
+            return default
+        return default.copy_modified(ret_type=ret_type)
 
     def _sqlmodel_model_construct_signature_callback(self, ctx: MethodSigContext) -> FunctionLike:
         receiver_info: TypeInfo | None = None
@@ -1306,6 +1381,27 @@ class SQLModelMypyPlugin(Plugin):
             if info is not None:
                 return Instance(info, [value_type])
         return ctx.default_return_type
+
+    def _sqlmodel_tuple_return_type_callback(self, ctx: FunctionContext) -> Type:
+        """Type `sqlmodel.tuple_(...)` as a SQLAlchemy tuple expression.
+
+        SQLModel currently annotates `tuple_` as returning a Python `tuple[Any, ...]`, but
+        SQLAlchemy's `tuple_()` returns an expression object that supports methods like `.in_(...)`.
+        """
+        default = ctx.default_return_type
+        proper_default = get_proper_type(default)
+
+        # Idempotency: if upstream typing already returns a SQLAlchemy expression, keep it.
+        if isinstance(proper_default, Instance):
+            if proper_default.type.fullname == "sqlalchemy.sql.elements.Tuple":
+                return default
+            if proper_default.type.fullname in {
+                "sqlalchemy.sql.elements.ColumnElement",
+                "sqlalchemy.sql.expression.ColumnElement",
+            }:
+                return default
+
+        return self._sqlalchemy_tuple_expr_type(ctx.api)
 
     @staticmethod
     def _lookup_var_in_mro(info: TypeInfo, name: str) -> Var | None:

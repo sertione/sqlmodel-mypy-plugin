@@ -266,7 +266,7 @@ repeated `assert obj.id is not None` (type clutter).
       overloads to narrow `id` to `int`.
   - Keep it optional and well-documented; default plugin behavior should remain conservative.
 
-## v0.17 (`tuple_()` should return a SQL expression, not a Python tuple)
+## v0.17 (`tuple_()` should return a SQL expression, not a Python tuple) - DONE
 
 **Motivation**: SQLModel re-exports `tuple_` from `sqlmodel.sql.expression`, but its typing currently says it returns a
 built-in `tuple[Any, ...]`. In SQLAlchemy, `tuple_()` returns a SQL expression object (`sqlalchemy.sql.elements.Tuple`)

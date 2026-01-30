@@ -1187,6 +1187,132 @@ def test_col_function_hook_returns_mapped_value_type() -> None:
     assert t.args and isinstance(t.args[0], Instance) and t.args[0].type.fullname == "builtins.int"
 
 
+def test_tuple_function_hook_returns_sqlalchemy_tuple_expression() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    hook = p.get_function_hook("sqlmodel.sql.expression.tuple_")
+    assert hook is not None
+
+    api = DummyCheckerAPI()
+    ctx = FunctionContext(
+        arg_types=[],
+        arg_kinds=[],
+        callee_arg_names=[],
+        arg_names=[],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[],
+        context=NameExpr("x"),
+        api=api,
+    )
+    t = hook(ctx)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    assert proper.type.fullname == "sqlalchemy.sql.elements.Tuple"
+
+
+def test_tuple_function_hook_falls_back_to_column_element_when_tuple_missing() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    p.lookup_fully_qualified = lambda _fullname: None  # type: ignore[method-assign]
+    hook = p.get_function_hook("sqlmodel.sql.expression.tuple_")
+    assert hook is not None
+
+    class NoTupleAPI(DummyCheckerAPI):
+        def named_generic_type(self, name: str, args: list[Type]) -> Instance:
+            if name in {"sqlalchemy.sql.elements.Tuple", "sqlalchemy.sql.expression.Tuple"}:
+                raise RuntimeError("missing")
+            return super().named_generic_type(name, args)
+
+    api = NoTupleAPI()
+    ctx = FunctionContext(
+        arg_types=[],
+        arg_kinds=[],
+        callee_arg_names=[],
+        arg_names=[],
+        default_return_type=AnyType(TypeOfAny.explicit),
+        args=[],
+        context=NameExpr("x"),
+        api=api,
+    )
+    t = hook(ctx)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    assert proper.type.fullname == "sqlalchemy.sql.elements.ColumnElement"
+
+
+def test_sqlalchemy_tuple_expr_type_falls_back_to_lookup_when_api_is_none() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+
+    tuple_info = make_typeinfo("builtins.tuple")
+    col_info = make_typeinfo("sqlalchemy.sql.elements.ColumnElement")
+
+    lookup_map = {
+        "builtins.tuple": tuple_info,
+        "sqlalchemy.sql.elements.ColumnElement": col_info,
+    }
+    p.lookup_fully_qualified = (  # type: ignore[method-assign]
+        lambda full: SimpleNamespace(node=lookup_map[full]) if full in lookup_map else None
+    )
+
+    t = p._sqlalchemy_tuple_expr_type(api=None)
+    proper = get_proper_type(t)
+    assert isinstance(proper, Instance)
+    assert proper.type.fullname == "sqlalchemy.sql.elements.ColumnElement"
+
+
+def test_tuple_signature_hook_updates_return_type() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    hook = p.get_function_signature_hook("sqlmodel.sql.expression.tuple_")
+    assert hook is not None
+
+    tuple_ret = Instance(make_typeinfo("builtins.tuple"), [AnyType(TypeOfAny.explicit)])
+    default_sig = CallableType(
+        [], [], [], tuple_ret, Instance(make_typeinfo("builtins.function"), [])
+    )
+    api = DummyCheckerAPI()
+    sig = hook(
+        FunctionSigContext(args=[], default_signature=default_sig, context=NameExpr("x"), api=api)
+    )
+    assert isinstance(sig, CallableType)
+    proper = get_proper_type(sig.ret_type)
+    assert isinstance(proper, Instance)
+    assert proper.type.fullname == "sqlalchemy.sql.elements.Tuple"
+
+
+def test_tuple_signature_hook_is_idempotent_for_expression_return_types() -> None:
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    hook = p.get_function_signature_hook("sqlmodel.sql.expression.tuple_")
+    assert hook is not None
+
+    api = DummyCheckerAPI()
+
+    sig_tuple = CallableType(
+        [],
+        [],
+        [],
+        Instance(make_typeinfo("sqlalchemy.sql.elements.Tuple"), []),
+        Instance(make_typeinfo("builtins.function"), []),
+    )
+    assert (
+        hook(
+            FunctionSigContext(args=[], default_signature=sig_tuple, context=NameExpr("x"), api=api)
+        )
+        is sig_tuple
+    )
+
+    sig_col = CallableType(
+        [],
+        [],
+        [],
+        Instance(
+            make_typeinfo("sqlalchemy.sql.elements.ColumnElement"), [AnyType(TypeOfAny.explicit)]
+        ),
+        Instance(make_typeinfo("builtins.function"), []),
+    )
+    assert (
+        hook(FunctionSigContext(args=[], default_signature=sig_col, context=NameExpr("x"), api=api))
+        is sig_col
+    )
+
+
 def test_getattr_function_hook_types_sqlmodel_table_members() -> None:
     p = plugin_mod.SQLModelMypyPlugin(Options())
     api = DummyCheckerAPI()
