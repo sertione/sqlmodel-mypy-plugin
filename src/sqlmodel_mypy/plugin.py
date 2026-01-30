@@ -21,6 +21,7 @@ from mypy.nodes import (
     Block,
     CallExpr,
     Decorator,
+    DictExpr,
     Expression,
     FuncDef,
     IfStmt,
@@ -158,7 +159,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 21
+__version__ = 22
 
 
 class _CollectedField(NamedTuple):
@@ -187,10 +188,6 @@ def _is_bool_nameexpr(expr: Expression, value: bool) -> bool:
 
 def _is_table_model(info: TypeInfo) -> bool:
     """Best-effort detection for `class Model(SQLModel, table=True)`."""
-    kw = info.defn.keywords.get("table")
-    if kw is not None:
-        return _is_bool_nameexpr(kw, True)
-
     # Prefer persisted metadata when the class-body AST isn't available
     # (common in incremental mode when loading modules from cache).
     metadata = getattr(info, "metadata", None)
@@ -204,10 +201,21 @@ def _is_table_model(info: TypeInfo) -> bool:
         if isinstance(md_table, bool):
             return md_table
 
+    model_config_table = _table_value_from_model_config_assignment(info)
+    if model_config_table is not None:
+        return model_config_table
+
+    kw = info.defn.keywords.get("table")
+    if kw is not None:
+        return _is_bool_nameexpr(kw, True)
+
     # Inherit `table=True` from bases if present.
     for base in info.mro[1:]:
         if base.fullname == SQLMODEL_BASEMODEL_FULLNAME:
             continue
+        base_model_config_table = _table_value_from_model_config_assignment(base)
+        if base_model_config_table is True:
+            return True
         kw = base.defn.keywords.get("table")
         if kw is not None and _is_bool_nameexpr(kw, True):
             return True
@@ -223,6 +231,46 @@ def _call_get_kwarg(call: CallExpr, name: str) -> Expression | None:
         if arg_name == name:
             return arg_expr
     return None
+
+
+def _table_value_from_model_config_assignment(info: TypeInfo) -> bool | None:
+    """Return statically-known `model_config['table']` if set in the class body."""
+    found: bool | None = None
+    defn = getattr(info, "defn", None)
+    defs = getattr(defn, "defs", None)
+    if not isinstance(defs, Block):
+        return None
+
+    for stmt in _iter_assignment_statements_from_block(defs):
+        if not stmt.lvalues:
+            continue
+        lhs = stmt.lvalues[0]
+        if not isinstance(lhs, NameExpr) or lhs.name != "model_config":
+            continue
+
+        value = stmt.rvalue
+        table_value: bool | None = None
+
+        if isinstance(value, DictExpr):
+            for key_expr, val_expr in value.items:
+                if not isinstance(key_expr, StrExpr) or key_expr.value != "table":
+                    continue
+                if _is_bool_nameexpr(val_expr, True):
+                    table_value = True
+                elif _is_bool_nameexpr(val_expr, False):
+                    table_value = False
+                break
+        elif isinstance(value, CallExpr):
+            table_expr = _call_get_kwarg(value, "table")
+            if table_expr is not None:
+                if _is_bool_nameexpr(table_expr, True):
+                    table_value = True
+                elif _is_bool_nameexpr(table_expr, False):
+                    table_value = False
+
+        if table_value is not None:
+            found = table_value
+    return found
 
 
 def _call_get_positional(call: CallExpr, index: int) -> Expression | None:

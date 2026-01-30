@@ -117,6 +117,103 @@ def test_is_table_model_inherits_from_base_metadata() -> None:
     assert plugin_mod._is_table_model(info) is True
 
 
+def test_is_table_model_detects_model_config_call_table_true() -> None:
+    info = make_sqlmodel_class("m.User")
+    true_expr = NameExpr("True")
+    true_expr.fullname = "builtins.True"
+    config_call = CallExpr(NameExpr("ConfigDict"), [true_expr], [ARG_NAMED], ["table"])
+    stmt = plugin_mod.AssignmentStmt([NameExpr("model_config")], config_call)
+    info.defn.defs.body.append(stmt)
+
+    assert plugin_mod._is_table_model(info) is True
+
+
+def test_is_table_model_detects_model_config_call_table_false() -> None:
+    info = make_sqlmodel_class("m.User")
+    false_expr = NameExpr("False")
+    false_expr.fullname = "builtins.False"
+    config_call = CallExpr(NameExpr("ConfigDict"), [false_expr], [ARG_NAMED], ["table"])
+    stmt = plugin_mod.AssignmentStmt([NameExpr("model_config")], config_call)
+    info.defn.defs.body.append(stmt)
+
+    assert plugin_mod._is_table_model(info) is False
+
+
+def test_is_table_model_detects_model_config_dict_table_true() -> None:
+    info = make_sqlmodel_class("m.User")
+    true_expr = NameExpr("True")
+    true_expr.fullname = "builtins.True"
+    config_dict = plugin_mod.DictExpr([(StrExpr("table"), true_expr)])
+    stmt = plugin_mod.AssignmentStmt([NameExpr("model_config")], config_dict)
+    info.defn.defs.body.append(stmt)
+
+    assert plugin_mod._is_table_model(info) is True
+
+
+def test_is_table_model_detects_model_config_dict_table_false() -> None:
+    info = make_sqlmodel_class("m.User")
+    false_expr = NameExpr("False")
+    false_expr.fullname = "builtins.False"
+    config_dict = plugin_mod.DictExpr(
+        [(StrExpr("extra"), StrExpr("forbid")), (StrExpr("table"), false_expr)]
+    )
+    stmt = plugin_mod.AssignmentStmt([NameExpr("model_config")], config_dict)
+    info.defn.defs.body.append(stmt)
+
+    assert plugin_mod._is_table_model(info) is False
+
+
+def test_is_table_model_inherits_from_base_model_config() -> None:
+    sqlmodel_info = make_typeinfo(plugin_mod.SQLMODEL_BASEMODEL_FULLNAME)
+    obj_info = make_typeinfo("builtins.object")
+
+    base_info = make_typeinfo("m.Base")
+    base_info.mro = [base_info, sqlmodel_info, obj_info]
+    true_expr = NameExpr("True")
+    true_expr.fullname = "builtins.True"
+    config_call = CallExpr(NameExpr("ConfigDict"), [true_expr], [ARG_NAMED], ["table"])
+    base_info.defn.defs.body.append(
+        plugin_mod.AssignmentStmt([NameExpr("model_config")], config_call)
+    )
+
+    info = make_typeinfo("m.User")
+    info.mro = [info, base_info, sqlmodel_info, obj_info]
+
+    assert plugin_mod._is_table_model(info) is True
+
+
+def test_is_bool_nameexpr_returns_false_for_non_nameexpr() -> None:
+    assert plugin_mod._is_bool_nameexpr(StrExpr("x"), True) is False
+
+
+def test_is_table_model_inherits_from_base_table_keyword() -> None:
+    sqlmodel_info = make_typeinfo(plugin_mod.SQLMODEL_BASEMODEL_FULLNAME)
+    obj_info = make_typeinfo("builtins.object")
+
+    base_info = make_typeinfo("m.Base")
+    base_info.mro = [base_info, sqlmodel_info, obj_info]
+    base_info.defn.keywords["table"] = NameExpr("True")
+
+    info = make_typeinfo("m.User")
+    info.mro = [info, base_info, sqlmodel_info, obj_info]
+
+    assert plugin_mod._is_table_model(info) is True
+
+
+def test_table_value_from_model_config_skips_empty_lvalues() -> None:
+    info = make_sqlmodel_class("m.User")
+    dummy = plugin_mod.AssignmentStmt([NameExpr("x")], NameExpr("y"))
+    dummy.lvalues = []  # type: ignore[assignment]
+    info.defn.defs.body.append(dummy)
+
+    true_expr = NameExpr("True")
+    true_expr.fullname = "builtins.True"
+    config_call = CallExpr(NameExpr("ConfigDict"), [true_expr], [ARG_NAMED], ["table"])
+    info.defn.defs.body.append(plugin_mod.AssignmentStmt([NameExpr("model_config")], config_call))
+
+    assert plugin_mod._is_table_model(info) is True
+
+
 def test_plugin_config_defaults_when_no_config_file() -> None:
     options = Options()
     options.config_file = None

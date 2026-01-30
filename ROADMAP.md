@@ -286,7 +286,7 @@ for otherwise normal SQLAlchemy patterns.
   - Add a mypy integration module demonstrating composite IN typing without ignores, e.g.:
     - `tuple_(User.id, User.team_id).in_([(1, 2)])`
 
-## v0.18 (Recognize `table=True` via `model_config["table"]`, not just class kwargs)
+## v0.18 (Recognize `table=True` via `model_config["table"]`, not just class kwargs) - DONE
 
 **Motivation**: SQLModel’s runtime `is_table_model_class()` checks `model_config.get("table")`, so a class can be a
 table model even when it isn’t declared as `class Model(SQLModel, table=True)`. Today our plugin/transformer only

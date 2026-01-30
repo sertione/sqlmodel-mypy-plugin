@@ -826,6 +826,48 @@ def test_transform_table_model_includes_relationship_kwargs_and_types() -> None:
     assert "zzz" in mc_arg_names
 
 
+def test_transform_table_model_via_model_config_includes_relationship_kwargs() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+    plugin_config = SimpleNamespace(
+        init_typed=True, init_forbid_extra=True, warn_untyped_fields=True
+    )
+    transformer = SQLModelTransformer(cls, cls, api, plugin_config)
+
+    true_expr = NameExpr("True")
+    true_expr.fullname = "builtins.True"
+    config_call = CallExpr(NameExpr("ConfigDict"), [true_expr], [ARG_NAMED], ["table"])
+    stmt_model_config = AssignmentStmt([NameExpr("model_config")], config_call)
+
+    # Required field.
+    any_t = AnyType(TypeOfAny.explicit)
+    name_var = Var("name", any_t)
+    cls.info.names["name"] = SymbolTableNode(MDEF, name_var)
+    stmt_name = AssignmentStmt(
+        [NameExpr("name")], make_field_call(fullname=SQLMODEL_FIELD_FULLNAME)
+    )
+    stmt_name.new_syntax = True
+
+    # Typed relationship.
+    team_info = make_typeinfo("m.Team")
+    team_t = Instance(team_info, [])
+    team_var = Var("team", team_t)
+    cls.info.names["team"] = SymbolTableNode(MDEF, team_var)
+    stmt_team = AssignmentStmt(
+        [NameExpr("team")], make_field_call(fullname=SQLMODEL_RELATIONSHIP_FULLNAME)
+    )
+    stmt_team.new_syntax = True
+
+    cls.defs.body.extend([stmt_model_config, stmt_name, stmt_team])
+    assert transformer.transform() is True
+
+    init_node = cls.info.names["__init__"].node
+    assert isinstance(init_node, FuncDef)
+    init_arg_names = [a.variable.name for a in init_node.arguments]
+    assert "kwargs" not in init_arg_names
+    assert "team" in init_arg_names
+
+
 def test_transform_non_table_model_does_not_accept_relationship_kwargs() -> None:
     cls = make_sqlmodel_class()
     api = DummyAPI()
