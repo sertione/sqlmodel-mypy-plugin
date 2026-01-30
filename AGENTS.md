@@ -47,8 +47,11 @@ make update-mypy
 ## What the plugin does (scope)
 
 - Collects SQLModel fields and determines required/optional kwargs based on `sqlmodel.Field(...)`.
-- **Ignores** `sqlmodel.Relationship(...)` when generating constructor kwargs.
+- For `table=True` models, includes `sqlmodel.Relationship(...)` members as **optional** constructor kwargs.
 - Synthesizes `__init__` and `model_construct` signatures for SQLModel subclasses during mypy semantic analysis.
+- Adjusts `table=True` SQLModel class attribute types to behave like SQLAlchemy expressions (e.g. `User.id` and relationship expression/comparator patterns).
+- Exposes SQLAlchemy table metadata on `table=True` models (e.g. `Model.__table__`).
+- Adds targeted typing fixes for common query patterns/helpers (`select(...)` 5+ entities fallback, `sqlmodel.tuple_(...)` as an expression, outer-join `None` propagation, broadened `Session.exec(...)`, optional typed `Session.execute(...)`, and best-effort `column_property(...)` return typing).
 
 ## Repo layout (where things live)
 
@@ -83,4 +86,4 @@ make update-mypy
 - To release:
   - Bump the version.
   - Tag `vX.Y.Z` and push the tag.
-  - GitHub Actions publishes to PyPI via **trusted publishing** (requires configuring the PyPI project + GitHub environment `pypi`).
+  - GitHub Actions publishes to PyPI via **trusted publishing**

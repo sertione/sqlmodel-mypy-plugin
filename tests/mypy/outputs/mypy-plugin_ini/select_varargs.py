@@ -20,6 +20,7 @@ stmt = select(Hero, Team, Hero.id, Team.id, Hero.name)
 
 # Prefer returning SQLModel's own `Select[...]` wrapper, with best-effort element typing.
 ok_stmt: SQLModelSelect[tuple[Hero, Team, int | None, int | None, str]] = stmt
+# MYPY: error: Incompatible types in assignment (expression has type "Select[tuple[type[Hero], type[Team], int | None, int | None, str]]", variable has type "Select[tuple[Hero, Team, int | None, int | None, str]]")  [assignment]
 
 engine = create_engine("sqlite://")
 

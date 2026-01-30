@@ -22,10 +22,17 @@ Planned work is tracked in [`ROADMAP.md`](ROADMAP.md).
 - Outer-join `None` propagation in `select(A, B).join(B, isouter=True)` result tuples.
 - Broaden `Session.exec()` / `AsyncSession.exec()` typing to accept SQLAlchemy `Executable` statements (e.g.
   `text(...)`), not just `select(...)`.
+- Optional typed `Session.execute()` / `AsyncSession.execute()` for `select(...)` (opt-in; see `typed_execute`).
 - Accept SQLAlchemy TypeEngine instances in `Field(sa_type=...)` (e.g. `DateTime(timezone=True)`, `String(50)`)
   without `# type: ignore` in strict mode.
 - Accept `model_config = ConfigDict(...)` overrides on SQLModel subclasses in strict mode.
 - Compatible with `pydantic.mypy` **when `sqlmodel_mypy.plugin` is listed first**.
+
+## Install
+
+```bash
+uv add sqlmodel-mypy-plugin
+```
 
 ## Install (dev)
 
@@ -73,6 +80,9 @@ Supported options:
   `__init__` / `model_construct` / constructor signatures, so mypy reports unexpected keyword arguments.
 - **`warn_untyped_fields`** (default: `true`): When `true`, emit error code `sqlmodel-field` for untyped
   declarations like `x = Field(...)` / `x = Relationship(...)` (use `x: T = ...` instead).
+- **`typed_execute`** (default: `false`): When `true`, type SQLModel’s deprecated `Session.execute()` /
+  `AsyncSession.execute()` for common `select(...)` statements by recovering `Result[...]` generics. This is meant to
+  reduce “type clutter” during migrations; prefer `Session.exec()` for new code.
 - **`debug_dataclass_transform`** (default: `false`): **Advanced/debug-only**. When `true`, keep SQLModel’s
   `__dataclass_transform__` handling enabled in mypy (useful for debugging plugin interactions; not recommended
   for normal use).
@@ -84,6 +94,7 @@ Supported options:
 init_typed = false
 init_forbid_extra = false
 warn_untyped_fields = true
+typed_execute = false
 debug_dataclass_transform = false
 ```
 
@@ -94,12 +105,15 @@ debug_dataclass_transform = false
 init_typed = false
 init_forbid_extra = false
 warn_untyped_fields = true
+typed_execute = false
 debug_dataclass_transform = false
 ```
 
 ## Error codes
 
 - `sqlmodel-field`: field-related plugin errors (e.g. untyped `x = Field(...)`).
+- `sqlmodel-plugin-order`: plugin ordering errors (e.g. `pydantic.mypy` enabled before `sqlmodel_mypy.plugin`).
+  Fix: list `sqlmodel_mypy.plugin` first (see [Enable in mypy](#enable-in-mypy)).
 
 ## SQL expression typing
 
@@ -124,11 +138,20 @@ tbl = User.__table__
 
 ### `getattr(Model, "field")` support
 
-If you build query filters dynamically, `getattr(Model, "field")` with a **string literal** is typed the same as
-direct `Model.field` access on `table=True` models:
+If you build query filters dynamically, `getattr(Model, "field")` with a **string literal** (or a `Final` / string
+`Literal[...]` name) is typed the same as direct `Model.field` access on `table=True` models:
 
 ```py
 stmt = select(User).where(getattr(User, "name").like("%x%"))
+```
+
+Example using a `Final` constant:
+
+```py
+from typing import Final
+
+FIELD: Final = "name"
+stmt = select(User).where(getattr(User, FIELD).like("%x%"))
 ```
 
 Non-literal names (runtime strings) are intentionally left as `Any` (you’ll still need a cast or a different

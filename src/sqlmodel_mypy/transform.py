@@ -1079,8 +1079,77 @@ def _is_bool_nameexpr(expr: Expression, value: bool) -> bool:
     return expr.fullname == "builtins.False" or expr.name == "False"
 
 
+def _call_get_kwarg(call: CallExpr, name: str) -> Expression | None:
+    for arg_name, arg_expr in zip(call.arg_names, call.args, strict=True):
+        if arg_name == name:
+            return arg_expr
+    return None
+
+
+def _iter_assignment_statements_from_if_statement(stmt: IfStmt) -> Iterator[AssignmentStmt]:
+    for body in stmt.body:
+        if not body.is_unreachable:
+            yield from _iter_assignment_statements_from_block(body)
+    if stmt.else_body is not None and not stmt.else_body.is_unreachable:
+        yield from _iter_assignment_statements_from_block(stmt.else_body)
+
+
+def _iter_assignment_statements_from_block(block: Block) -> Iterator[AssignmentStmt]:
+    for stmt in block.body:
+        if isinstance(stmt, AssignmentStmt):
+            yield stmt
+        elif isinstance(stmt, IfStmt):
+            yield from _iter_assignment_statements_from_if_statement(stmt)
+
+
+def _table_value_from_model_config_assignment(info: TypeInfo) -> bool | None:
+    """Return statically-known `model_config['table']` if set in the class body.
+
+    Supports patterns like:
+    - `model_config = ConfigDict(table=True)`
+    - `model_config = {"table": True}`
+    """
+    found: bool | None = None
+    cls_def = info.defn
+
+    for stmt in _iter_assignment_statements_from_block(cls_def.defs):
+        if not stmt.lvalues:
+            continue
+        lhs = stmt.lvalues[0]
+        if not isinstance(lhs, NameExpr) or lhs.name != "model_config":
+            continue
+
+        value = stmt.rvalue
+        table_value: bool | None = None
+
+        if isinstance(value, DictExpr):
+            for key_expr, val_expr in value.items:
+                if not isinstance(key_expr, StrExpr) or key_expr.value != "table":
+                    continue
+                if _is_bool_nameexpr(val_expr, True):
+                    table_value = True
+                elif _is_bool_nameexpr(val_expr, False):
+                    table_value = False
+                break
+        elif isinstance(value, CallExpr):
+            table_expr = _call_get_kwarg(value, "table")
+            if table_expr is not None:
+                if _is_bool_nameexpr(table_expr, True):
+                    table_value = True
+                elif _is_bool_nameexpr(table_expr, False):
+                    table_value = False
+
+        if table_value is not None:
+            found = table_value
+    return found
+
+
 def _is_table_model(info: TypeInfo) -> bool:
     """Best-effort detection for `class Model(SQLModel, table=True)`."""
+    model_config_table = _table_value_from_model_config_assignment(info)
+    if model_config_table is not None:
+        return model_config_table
+
     kw = info.defn.keywords.get("table")
     if kw is not None:
         return _is_bool_nameexpr(kw, True)
@@ -1101,6 +1170,9 @@ def _is_table_model(info: TypeInfo) -> bool:
     for base in info.mro[1:]:
         if base.fullname == SQLMODEL_BASEMODEL_FULLNAME:
             continue
+        base_model_config_table = _table_value_from_model_config_assignment(base)
+        if base_model_config_table is True:
+            return True
         kw = base.defn.keywords.get("table")
         if kw is not None and _is_bool_nameexpr(kw, True):
             return True
