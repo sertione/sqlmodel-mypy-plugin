@@ -40,6 +40,7 @@ from sqlmodel_mypy.transform import (
     SQLModelRelationship,
     SQLModelTransformer,
     _callee_fullname,
+    _parse_annotated_field_metadata_by_line,
     add_method,
 )
 
@@ -427,6 +428,110 @@ def test_get_field_aliases_covers_common_cases() -> None:
     )
     stmt.new_syntax = True
     assert SQLModelTransformer.get_field_aliases(stmt) == []
+
+
+def test_parse_annotated_field_metadata_by_line_covers_common_cases() -> None:
+    src = """
+from __future__ import annotations
+
+from typing import Annotated, Optional
+
+from sqlmodel import Field, SQLModel
+
+
+class Model(SQLModel):
+    id: Annotated[int | None, Field(default=None, primary_key=True)]
+    name: Annotated[str, Field(alias="full_name")]
+    v: Optional[Annotated[str, Field(default=None, alias="a", validation_alias="va")]]
+""".lstrip()
+
+    out = _parse_annotated_field_metadata_by_line(src)
+
+    lines = src.splitlines()
+    id_line = next(i for i, line in enumerate(lines, start=1) if "id:" in line)
+    name_line = next(i for i, line in enumerate(lines, start=1) if "name:" in line)
+    v_line = next(i for i, line in enumerate(lines, start=1) if "v:" in line)
+
+    assert out[id_line] == (True, [])
+    assert out[name_line] == (False, ["full_name"])
+    assert out[v_line] == (True, ["a", "va"])
+
+
+def test_parse_annotated_field_metadata_by_line_covers_defaultish_hints_and_union_syntax() -> None:
+    src = """
+from __future__ import annotations
+
+import sqlmodel
+from typing import Annotated
+
+from sqlalchemy import Column, Computed, String, text
+
+
+class Model(sqlmodel.SQLModel):
+    a: Annotated[str, sqlmodel.Field(alias="attr_alias")]
+    b: Annotated[str, sqlmodel.Field(alias="a", schema_extra={"validation_alias": "sa"})]
+    c: Annotated[int, sqlmodel.Field(default=...)]
+    d: Annotated[int, sqlmodel.Field(default_factory=None)]
+    e: Annotated[int, sqlmodel.Field(default_factory=lambda: 1)]
+    f: Annotated[str, sqlmodel.Field(nullable=True)]
+    g: Annotated[str, sqlmodel.Field(sa_column=Column("g", String(), nullable=True))]
+    h: Annotated[str | None, sqlmodel.Field(sa_column=Column("h", String(), Computed("1", persisted=True)))]
+    i: Annotated[str, sqlmodel.Field(sa_column=Column("i", String(), server_default=text("'x'")))]
+    j: Annotated[str, sqlmodel.Field(sa_column_kwargs={"server_default": "x"})]
+    k: Annotated[str, sqlmodel.Field(alias="k")] | None
+""".lstrip()
+
+    out = _parse_annotated_field_metadata_by_line(src)
+    lines = src.splitlines()
+
+    def ln(prefix: str) -> int:
+        return next(i for i, line in enumerate(lines, start=1) if line.strip().startswith(prefix))
+
+    assert out[ln("a:")] == (False, ["attr_alias"])
+    assert out[ln("b:")] == (False, ["a", "sa"])
+    assert out[ln("c:")] == (False, [])
+    assert out[ln("d:")] == (False, [])
+    assert out[ln("e:")] == (True, [])
+    assert out[ln("f:")] == (True, [])
+    assert out[ln("g:")] == (True, [])
+    assert out[ln("h:")] == (True, [])
+    assert out[ln("i:")] == (True, [])
+    assert out[ln("j:")] == (True, [])
+    assert out[ln("k:")] == (False, ["k"])
+
+
+def test_parse_annotated_field_metadata_by_line_exercises_edge_paths() -> None:
+    assert _parse_annotated_field_metadata_by_line("class C(") == {}
+
+    src = """
+from __future__ import annotations
+
+from typing import Annotated
+
+from sqlmodel import Field, SQLModel
+
+
+class Model(SQLModel):
+    # alias=None should be ignored
+    a: Annotated[str, Field(alias=None)]
+    # Python keyword aliases should be ignored
+    b: Annotated[str, Field(alias="class")]
+    # Annotated metadata with no Field(...) should be ignored
+    c: Annotated[str, "meta"]
+
+    def method(self) -> None:
+        self.x = 1
+""".lstrip()
+
+    out = _parse_annotated_field_metadata_by_line(src)
+    lines = src.splitlines()
+    a_line = next(i for i, line in enumerate(lines, start=1) if line.strip().startswith("a:"))
+    b_line = next(i for i, line in enumerate(lines, start=1) if line.strip().startswith("b:"))
+    c_line = next(i for i, line in enumerate(lines, start=1) if line.strip().startswith("c:"))
+
+    assert out[a_line] == (False, [])
+    assert out[b_line] == (False, [])
+    assert c_line not in out
 
 
 def test_collect_member_from_stmt_untyped_warns() -> None:

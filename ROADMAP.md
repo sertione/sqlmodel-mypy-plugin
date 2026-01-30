@@ -212,29 +212,7 @@ models do provide this at runtime for `table=True`, but type checkers can miss i
 - Best-effort typing for `column_property(...)` return type (infer `Mapped[T]`) to support
   `Model._foo = column_property(...)` patterns.
 
-## v0.13 (SQLModel docs parity suite) - TODO
-
-**Motivation**: the north star is “SQLModel as documented works under `mypy --strict` with minimal casts/ignores”.
-We should lock this down with a dedicated docs-parity integration suite (beyond the current focused unit-style
-mypy modules).
-
-- **Add docs-derived mypy integration modules**
-  - Create minimal, type-focused modules under `tests/mypy/modules/` that mirror official docs patterns (as close
-    as possible, but stripped of runtime/demo noise).
-  - Add them to `tests/mypy/test_mypy.py` and commit golden outputs under `tests/mypy/outputs/**`.
-  - Target doc pages / patterns:
-    - Connected-data joins and outer-joins:
-      - Docs: `https://sqlmodel.tiangolo.com/tutorial/connect/read-connected-data/`
-    - Relationship attribute creation/update patterns (constructor kwargs + mutation):
-      - Docs: `https://sqlmodel.tiangolo.com/tutorial/relationship-attributes/create-and-update-relationships/`
-    - Many-to-many relationship creation patterns:
-      - Docs: `https://sqlmodel.tiangolo.com/tutorial/many-to-many/create-data/`
-    - Update patterns using `sqlmodel_update()` / `model_dump(exclude_unset=True)`:
-      - Docs: `https://sqlmodel.tiangolo.com/tutorial/fastapi/update/`
-      - Source: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py` (`SQLModel.sqlmodel_update`)
-  - Ensure strict-mode expectations are explicit (via `# MYPY:` comments and/or `reveal_type(...)` assertions).
-
-## v0.14 (`typing.Annotated[...]` field metadata support) - TODO
+## v0.14 (`typing.Annotated[...]` field metadata support) - DONE
 
 **Motivation**: SQLModel (Pydantic v2) supports `Annotated`-driven typing patterns, and users will naturally try to
 use them to reduce `= Field(...)` assignment noise. Under `--strict`, we should still generate correct constructor
@@ -256,7 +234,7 @@ signatures (required/optional + alias kwargs) when `Field(...)` metadata lives i
     - Release note: “Fix support for types with `Optional[Annotated[x, f()]]`…” (PR #1093):
       `https://github.com/fastapi/sqlmodel/pull/1093`
 
-## v0.15 (Outer-join `None` propagation for relationship-attribute joins) - TODO
+## v0.15 (Outer-join `None` propagation for relationship-attribute joins) - DONE
 
 **Motivation**: we currently propagate `None` on outer-joins only when the join target is a direct model class
 (e.g. `.join(Team, isouter=True)`). A common ORM pattern is to join via relationship attributes
@@ -273,7 +251,7 @@ signatures (required/optional + alias kwargs) when `Field(...)` metadata lives i
   - Add mypy integration coverage under `tests/mypy/modules/` for relationship-attribute joins, including the SQLModel
     docs pattern of `Team: None` on outer-joins.
 
-## v0.16 (Strict typing ergonomics add-ons, opt-in) - TODO
+## v0.16 (Strict typing ergonomics add-ons, opt-in) - DONE
 
 **Motivation**: strict typing + SQLModel often means the database populates values “later” (after flush/commit/
 refresh), especially primary keys (`id: int | None`). Mypy can’t infer those runtime effects, and users end up with
@@ -287,3 +265,47 @@ repeated `assert obj.id is not None` (type clutter).
     - `assert_persisted(obj)` / `require_id(obj)` / `ensure_persisted(obj)` returning a `TypeGuard[...]` or using
       overloads to narrow `id` to `int`.
   - Keep it optional and well-documented; default plugin behavior should remain conservative.
+
+## v0.17 (`tuple_()` should return a SQL expression, not a Python tuple)
+
+**Motivation**: SQLModel re-exports `tuple_` from `sqlmodel.sql.expression`, but its typing currently says it returns a
+built-in `tuple[Any, ...]`. In SQLAlchemy, `tuple_()` returns a SQL expression object (`sqlalchemy.sql.elements.Tuple`)
+which supports expression methods like `.in_(...)`. Under `--strict` this mismatch forces `cast(...)` / `# type: ignore`
+for otherwise normal SQLAlchemy patterns.
+
+- **Fix `sqlmodel.tuple_` / `sqlmodel.sql.expression.tuple_` return type**
+  - Add a plugin return-type hook for:
+    - `sqlmodel.sql.expression.tuple_`
+    - `sqlmodel.tuple_` (re-export)
+  - Prefer returning `sqlalchemy.sql.elements.Tuple` (or fall back to `ColumnElement[tuple[Any, ...]]` if stubs vary).
+  - Source references:
+    - SQLModel wrapper: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/sql/expression.py`
+    - SQLAlchemy `tuple_` constructor: `https://github.com/sqlalchemy/sqlalchemy/blob/main/lib/sqlalchemy/sql/_elements_constructors.py`
+    - SQLAlchemy `Tuple` expression class: `https://github.com/sqlalchemy/sqlalchemy/blob/main/lib/sqlalchemy/sql/elements.py`
+- **Tests**
+  - Add a mypy integration module demonstrating composite IN typing without ignores, e.g.:
+    - `tuple_(User.id, User.team_id).in_([(1, 2)])`
+
+## v0.18 (Recognize `table=True` via `model_config["table"]`, not just class kwargs)
+
+**Motivation**: SQLModel’s runtime `is_table_model_class()` checks `model_config.get("table")`, so a class can be a
+table model even when it isn’t declared as `class Model(SQLModel, table=True)`. Today our plugin/transformer only
+looks at the class keyword, so “table-only” behaviors may not activate (expression typing, relationship kwargs in
+constructor signatures, `__table__`, etc.).
+
+- **Detect table models via `model_config` (metadata-driven)**
+  - Extend semantic analysis in `src/sqlmodel_mypy/transform.py` to detect a statically-known class-body assignment like:
+    - `model_config = ConfigDict(table=True)` or equivalent SQLModel config helpers
+  - Persist the result in `TypeInfo.metadata["sqlmodel-mypy-metadata"]`, then update `_is_table_model(...)` in:
+    - `src/sqlmodel_mypy/plugin.py`
+    - `src/sqlmodel_mypy/transform.py`
+    to consult metadata first (then fall back to `table=True` in the class definition).
+  - Source references:
+    - SQLModel metaclass reads config: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/main.py` (`SQLModelMetaclass.__new__`)
+    - SQLModel runtime table detection: `https://github.com/fastapi/sqlmodel/blob/main/sqlmodel/_compat.py` (`is_table_model_class`)
+- **Tests**
+  - Add mypy integration coverage for a table model enabled via `model_config` and assert the same behavior as
+    `table=True`:
+    - class attribute expression typing (e.g. `User.id.in_([1])`)
+    - constructor accepts relationship kwargs when configured (`init_forbid_extra=true`)
+    - `User.__table__` is typed and present

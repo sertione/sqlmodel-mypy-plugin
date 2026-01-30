@@ -174,6 +174,23 @@ Limitations:
 - Mypy can’t express “either field name or alias is required”, so aliased required fields may not be reported as
   missing at type-check time.
 
+## Persisted model helpers (opt-in)
+
+Strict typing + SQLModel often means table-model IDs start as `None` and are populated after flush/commit/refresh
+(see [SQLModel: Automatic IDs, None, and Refresh](https://sqlmodel.tiangolo.com/tutorial/automatic-id-none-refresh/)).
+Mypy can’t infer those runtime effects, so you can end up with repeated `assert obj.id is not None`.
+
+This package ships small helpers you can import (they do **not** affect plugin behavior):
+
+```py
+from sqlmodel_mypy import has_id, require_id
+
+hero_id: int = require_id(hero)  # raises ValueError if hero.id is None
+
+if has_id(hero):
+    ok_id: int = hero.id
+```
+
 ## Development
 
 - List available commands: `make help`
@@ -181,7 +198,7 @@ Limitations:
 - Typecheck plugin code: `make typecheck`
 - Run tests: `make test`
 - Run all quality gates: `make check`
-- Update mypy \u201cgolden\u201d outputs: `make update-mypy`
+- Update mypy "golden" outputs: `make update-mypy`
 
 See [`AGENTS.md`](AGENTS.md) for repo conventions and workflow notes.
 
