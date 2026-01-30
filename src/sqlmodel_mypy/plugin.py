@@ -154,7 +154,7 @@ SQLMODEL_SESSION_EXEC_FULLNAME = "sqlmodel.orm.session.Session.exec"
 SQLMODEL_ASYNC_SESSION_EXEC_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSession.exec"
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 19
+__version__ = 20
 
 
 class _CollectedField(NamedTuple):
@@ -187,12 +187,29 @@ def _is_table_model(info: TypeInfo) -> bool:
     if kw is not None:
         return _is_bool_nameexpr(kw, True)
 
+    # Prefer persisted metadata when the class-body AST isn't available
+    # (common in incremental mode when loading modules from cache).
+    metadata = getattr(info, "metadata", None)
+    md = metadata.get(METADATA_KEY) if isinstance(metadata, dict) else None
+    if isinstance(md, dict):
+        md_table = md.get("is_table_model")
+        if isinstance(md_table, bool):
+            return md_table
+        # Backwards-compatible alias for older metadata shapes.
+        md_table = md.get("table")
+        if isinstance(md_table, bool):
+            return md_table
+
     # Inherit `table=True` from bases if present.
     for base in info.mro[1:]:
         if base.fullname == SQLMODEL_BASEMODEL_FULLNAME:
             continue
         kw = base.defn.keywords.get("table")
         if kw is not None and _is_bool_nameexpr(kw, True):
+            return True
+        base_metadata = getattr(base, "metadata", None)
+        base_md = base_metadata.get(METADATA_KEY) if isinstance(base_metadata, dict) else None
+        if isinstance(base_md, dict) and base_md.get("is_table_model") is True:
             return True
     return False
 

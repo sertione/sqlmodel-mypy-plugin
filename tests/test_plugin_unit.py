@@ -95,6 +95,28 @@ def make_sqlmodel_class(fullname: str) -> TypeInfo:
     return info
 
 
+def test_is_table_model_uses_persisted_table_metadata() -> None:
+    info = make_sqlmodel_class("m.User")
+    info.metadata[plugin_mod.METADATA_KEY] = {"table": True}
+
+    assert plugin_mod._is_table_model(info) is True
+
+
+def test_is_table_model_inherits_from_base_metadata() -> None:
+    sqlmodel_info = make_typeinfo(plugin_mod.SQLMODEL_BASEMODEL_FULLNAME)
+    obj_info = make_typeinfo("builtins.object")
+
+    base_info = make_typeinfo("m.Base")
+    base_info.mro = [base_info, sqlmodel_info, obj_info]
+    base_info.metadata[plugin_mod.METADATA_KEY] = {"is_table_model": True}
+
+    info = make_typeinfo("m.User")
+    info.mro = [info, base_info, sqlmodel_info, obj_info]
+    info.metadata[plugin_mod.METADATA_KEY] = {"fields": {}, "relationships": {}}
+
+    assert plugin_mod._is_table_model(info) is True
+
+
 def test_plugin_config_defaults_when_no_config_file() -> None:
     options = Options()
     options.config_file = None

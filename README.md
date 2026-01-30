@@ -198,7 +198,7 @@ if has_id(hero):
 - Typecheck plugin code: `make typecheck`
 - Run tests: `make test`
 - Run all quality gates: `make check`
-- Update mypy \u201cgolden\u201d outputs: `make update-mypy`
+- Update mypy "golden" outputs: `make update-mypy`
 
 See [`AGENTS.md`](AGENTS.md) for repo conventions and workflow notes.
 

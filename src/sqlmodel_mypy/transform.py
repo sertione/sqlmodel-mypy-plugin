@@ -546,6 +546,7 @@ class SQLModelTransformer:
         self.add_model_construct(fields, relationship_list)
 
         info.metadata[METADATA_KEY] = {
+            "is_table_model": _is_table_model(info),
             "fields": {field.name: field.serialize() for field in fields},
             "relationships": {k: relationships[k].serialize() for k in sorted(relationships)},
         }
@@ -1084,12 +1085,27 @@ def _is_table_model(info: TypeInfo) -> bool:
     if kw is not None:
         return _is_bool_nameexpr(kw, True)
 
+    # Prefer persisted metadata when the class-body AST isn't available
+    # (common in incremental mode when loading modules from cache).
+    md = info.metadata.get(METADATA_KEY)
+    if isinstance(md, dict):
+        md_table = md.get("is_table_model")
+        if isinstance(md_table, bool):
+            return md_table
+        # Backwards-compatible alias for older metadata shapes.
+        md_table = md.get("table")
+        if isinstance(md_table, bool):
+            return md_table
+
     # Inherit `table=True` from bases if present.
     for base in info.mro[1:]:
         if base.fullname == SQLMODEL_BASEMODEL_FULLNAME:
             continue
         kw = base.defn.keywords.get("table")
         if kw is not None and _is_bool_nameexpr(kw, True):
+            return True
+        base_md = base.metadata.get(METADATA_KEY)
+        if isinstance(base_md, dict) and base_md.get("is_table_model") is True:
             return True
     return False
 

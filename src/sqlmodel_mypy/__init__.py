@@ -1,4 +1,4 @@
-__version__ = "0.12.3"
+__version__ = "0.16.0"
 
 from .persisted import HasId, HasOptionalId, has_id, require_id
 
