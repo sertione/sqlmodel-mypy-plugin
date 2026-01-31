@@ -28,5 +28,6 @@ with Session(engine) as session:
         ok_team: Team | None = team
 
         bad_team: Team = team
+# MYPY: error: Incompatible types in assignment (expression has type "Team | None", variable has type "Team")  [assignment]
         if team is not None:
             ok_team_name: str = team.name
