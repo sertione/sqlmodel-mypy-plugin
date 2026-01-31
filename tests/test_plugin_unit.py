@@ -2941,3 +2941,28 @@ def test_select_signature_hook_is_idempotent_for_star_overload() -> None:
         hook(FunctionSigContext(args=[], default_signature=default_sig, context=call, api=api))
         is default_sig
     )
+
+
+def test_sqlalchemy_typing_helpers_fallback_to_any(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cover SQLAlchemy typing helper fallbacks (best-effort robustness)."""
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    any_t = AnyType(TypeOfAny.explicit)
+
+    def _no_lookup(_plugin: object, _fullname: str) -> None:
+        return None
+
+    monkeypatch.setattr(plugin_mod, "_lookup_typeinfo", _no_lookup)
+
+    assert isinstance(get_proper_type(p._sqlalchemy_table_type(None)), AnyType)
+    assert isinstance(get_proper_type(p._sqlalchemy_mapper_type(None, any_t)), AnyType)
+    assert isinstance(get_proper_type(p._sqlalchemy_instance_state_type(None, any_t)), AnyType)
+
+
+def test_sqlalchemy_instance_state_type_uses_named_generic_type() -> None:
+    """Cover the fast-path branch for InstanceState typing."""
+    p = plugin_mod.SQLModelMypyPlugin(Options())
+    api = DummyCheckerAPI()
+    any_t = AnyType(TypeOfAny.explicit)
+
+    out = p._sqlalchemy_instance_state_type(api, any_t)
+    assert isinstance(get_proper_type(out), Instance)

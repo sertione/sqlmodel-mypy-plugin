@@ -347,3 +347,21 @@ SQLModel overrides `execute()` and types it as `Result[Any]`, shadowing SQLAlche
 - Config: `typed_execute = true` under `[sqlmodel-mypy]`
 - Code: `SQLModelPluginConfig.typed_execute`, `_sqlmodel_session_execute_return_type_callback()`, `_row_tuple_type_from_typed_statement()`
 - Tests: `tests/mypy/configs/mypy-plugin-strict-typed-execute.ini`, `tests/mypy/modules/session_execute_typed.py`
+
+## v0.19 (ORM introspection parity) - DONE
+
+**Motivation**: SQLModel is built on SQLAlchemy ORM, and real-world projects commonly rely on ORM introspection
+(`inspect(...)`, `Model.__mapper__`) in addition to CRUD/query building. Strict mypy should not force `cast(...)`
+or `# type: ignore` for these basic ORM workflows.
+
+- **Expose and type `__mapper__` on `table=True` SQLModel models**
+  - Add a plugin-generated `__mapper__` attribute typed as `sqlalchemy.orm.Mapper[Model]`.
+  - Code: `src/sqlmodel_mypy/plugin.py` (`_add_table_dunders()`, `_sqlalchemy_mapper_type()`)
+- **Type `inspect(Model)` / `inspect(model)` for SQLModel table models**
+  - Cover both `sqlalchemy.inspect` and SQLModel’s re-export `sqlmodel.inspect`.
+  - `inspect(User)` -> `Mapper[User]`
+  - `inspect(user)` -> `InstanceState[User]`
+  - Code: `src/sqlmodel_mypy/plugin.py` (`_sqlalchemy_inspect_return_type_callback()`,
+    `_sqlalchemy_instance_state_type()`)
+- **Tests**
+  - `tests/mypy/modules/table_dunders.py`
