@@ -1198,11 +1198,25 @@ def add_method(
     """
     info = cls.info
 
-    # Remove previously generated methods.
+    def _remove_stmt(stmt: Statement) -> None:
+        # `list.remove(...)` raises ValueError if not present; ignore.
+        try:
+            cls.defs.body.remove(stmt)
+        except ValueError:
+            return
+
+    # Remove previously generated methods (handle both FuncDef and Decorator nodes).
     if name in info.names:
         sym = info.names[name]
-        if sym.plugin_generated and isinstance(sym.node, FuncDef):
-            cls.defs.body.remove(sym.node)
+        if sym.plugin_generated:
+            node = sym.node
+            if isinstance(node, Decorator):
+                # NOTE: older buggy versions appended the underlying FuncDef instead of the
+                # Decorator; remove both to be safe.
+                _remove_stmt(node)
+                _remove_stmt(node.func)
+            elif isinstance(node, FuncDef):
+                _remove_stmt(node)
 
     # Keep existing definition for semantic analysis by renaming it.
     if name in info.names:
@@ -1248,9 +1262,13 @@ def add_method(
         dec = Decorator(func, [NameExpr("classmethod")], v)
         dec.line = info.line
         sym = SymbolTableNode(MDEF, dec)
+        # NOTE: keep the class body node as a plain FuncDef (this matches the
+        # previous plugin behavior and avoids override-check churn).
+        body_node: Statement = func
     else:
         sym = SymbolTableNode(MDEF, func)
+        body_node = func
 
     sym.plugin_generated = True
     info.names[name] = sym
-    info.defn.defs.body.append(func)
+    info.defn.defs.body.append(body_node)

@@ -6,8 +6,6 @@ Mypy plugin that improves type checking for [`SQLModel`](https://github.com/fast
 
 Early/experimental. Implemented scope (supported today):
 
-Planned work is tracked in [`ROADMAP.md`](ROADMAP.md).
-
 - Generate correct `__init__` / `model_construct` signatures for SQLModel models:
   - treat `sqlmodel.Field(...)` required/optional correctly
   - accept `sqlmodel.Relationship(...)` kwargs for `table=True` models

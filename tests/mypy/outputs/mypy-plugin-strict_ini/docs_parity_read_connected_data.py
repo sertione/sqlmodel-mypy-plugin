@@ -37,7 +37,6 @@ with Session(engine) as session:
     stmt_heroes_only = select(Hero).join(Team).where(Team.name == "Preventers")
     for hero3 in session.exec(stmt_heroes_only):
         ok_hero3: Hero = hero3
-# MYPY: error: Incompatible types in assignment (expression has type "tuple[Hero]", variable has type "Hero")  [assignment]
 
     # Docs pattern: LEFT OUTER join via isouter=True.
     stmt_outer = select(Hero, Team).join(Team, isouter=True)
@@ -47,3 +46,4 @@ with Session(engine) as session:
 
         # Outer join may yield `None` for the right-hand entity.
         bad_team4: Team = team4
+# MYPY: error: Incompatible types in assignment (expression has type "Team | None", variable has type "Team")  [assignment]

@@ -171,7 +171,7 @@ SQLALCHEMY_INSPECT_FULLNAMES = {
 }
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 25
+__version__ = 26
 
 
 class _CollectedField(NamedTuple):
@@ -1274,34 +1274,6 @@ class SQLModelMypyPlugin(Plugin):
             if isinstance(proper, UnionType):
                 return any(_contains_instance_fullname(item, fullname) for item in proper.items)
             return False
-
-        # Accept SQLAlchemy `Select[...]` in `Session.exec(...)`.
-        #
-        # SQLModel defines its own `Select[...]` wrapper class and types `Session.exec` to accept it,
-        # but users often import and use SQLAlchemy's `select()` directly. Runtime supports it, and
-        # with this adjustment we preserve a correctly-shaped `TupleResult[...]` return type.
-        sqlmodel_select_info = _lookup_typeinfo(self, SQLMODEL_SELECT_CLS_FULLNAME)
-        sqlalchemy_select_info = _lookup_typeinfo(self, SQLALCHEMY_SELECT_FULLNAME)
-        if sqlmodel_select_info is not None and sqlalchemy_select_info is not None:
-            if _contains_instance_fullname(default.arg_types[0], sqlmodel_select_info.fullname):
-                # Idempotency: if upstream stubs already accept SQLAlchemy Select, keep unchanged.
-                if not _contains_instance_fullname(
-                    default.arg_types[0], sqlalchemy_select_info.fullname
-                ):
-                    proper_arg0 = get_proper_type(default.arg_types[0])
-                    if isinstance(proper_arg0, Instance) and proper_arg0.args:
-                        row_type = proper_arg0.args[0]
-                    else:
-                        row_type = _plugin_any()
-                    sqlalchemy_select = Instance(
-                        sqlalchemy_select_info,
-                        [row_type] * len(sqlalchemy_select_info.defn.type_vars),
-                    )
-                    new_arg_types = list(default.arg_types)
-                    new_arg_types[0] = UnionType.make_union(
-                        [default.arg_types[0], sqlalchemy_select]
-                    )
-                    return default.copy_modified(arg_types=new_arg_types)
 
         # Only adjust the broad overload; keep Select/SelectOfScalar overloads precise.
         broad = False

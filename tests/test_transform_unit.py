@@ -657,7 +657,58 @@ def test_add_method_generates_and_replaces_methods() -> None:
         api, cls, "cm", args=[arg], return_type=AnyType(TypeOfAny.explicit), is_classmethod=True
     )
     assert "cm" in cls.info.names
-    assert isinstance(cls.info.names["cm"].node, Decorator)
+    cm_node = cls.info.names["cm"].node
+    assert isinstance(cm_node, Decorator)
+    assert cm_node.func.is_class is True
+    assert cm_node not in cls.defs.body
+    assert cm_node.func in cls.defs.body
+
+
+def test_add_method_classmethod_reentry_is_idempotent_and_handles_legacy_body() -> None:
+    api = DummyAPI()
+    cls = make_sqlmodel_class()
+
+    any_t = AnyType(TypeOfAny.explicit)
+    arg = Argument(Var("x", any_t), any_t, None, ARG_NAMED)
+
+    # First generation
+    add_method(
+        api, cls, "cm", args=[arg], return_type=AnyType(TypeOfAny.explicit), is_classmethod=True
+    )
+    node1 = cls.info.names["cm"].node
+    assert isinstance(node1, Decorator)
+    assert node1 not in cls.defs.body
+    assert node1.func in cls.defs.body
+    assert node1.func.is_class is True
+
+    # Re-entry: previously generated Decorator should be removed, no duplicates.
+    add_method(
+        api, cls, "cm", args=[arg], return_type=AnyType(TypeOfAny.explicit), is_classmethod=True
+    )
+    node2 = cls.info.names["cm"].node
+    assert isinstance(node2, Decorator)
+    assert node2 not in cls.defs.body
+    assert node2.func in cls.defs.body
+    assert node1.func not in cls.defs.body
+    assert node2.func.is_class is True
+    assert sum(1 for s in cls.defs.body if isinstance(s, FuncDef) and s.name == "cm") == 1
+
+    # Simulate legacy buggy state: body contains both Decorator and FuncDef.
+    cls.defs.body.append(node2)
+    assert node2 in cls.defs.body
+    assert node2.func in cls.defs.body
+
+    add_method(
+        api, cls, "cm", args=[arg], return_type=AnyType(TypeOfAny.explicit), is_classmethod=True
+    )
+    node3 = cls.info.names["cm"].node
+    assert isinstance(node3, Decorator)
+    assert node3 not in cls.defs.body
+    assert node3.func in cls.defs.body
+    assert node2 not in cls.defs.body
+    assert node2.func not in cls.defs.body
+    assert node3.func.is_class is True
+    assert sum(1 for s in cls.defs.body if isinstance(s, FuncDef) and s.name == "cm") == 1
 
 
 def test_transform_defer_paths() -> None:
