@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlmodel-mypy-plugin"
-version = "0.18.0"
+version = "0.19.0"
 description = "Mypy plugin for SQLModel (better constructor/Field typing)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-authors = [{ name = "Artem" }]
+authors = [{ name = "sertione" }]
 keywords = ["mypy", "plugin", "sqlmodel", "pydantic", "sqlalchemy", "typing"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3 :: Only",

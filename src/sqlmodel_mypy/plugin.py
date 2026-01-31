@@ -163,8 +163,15 @@ SQLMODEL_ASYNC_SESSION_EXECUTE_FULLNAME = "sqlmodel.ext.asyncio.session.AsyncSes
 
 SQLMODEL_SELECT_OF_SCALAR_CLS_FULLNAME = "sqlmodel.sql._expression_select_cls.SelectOfScalar"
 
+# `inspect` is re-exported from `sqlalchemy` and `sqlmodel`.
+SQLALCHEMY_INSPECT_FULLNAMES = {
+    "sqlalchemy.inspect",
+    "sqlalchemy.inspection.inspect",
+    "sqlmodel.inspect",
+}
+
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 23
+__version__ = 25
 
 
 class _CollectedField(NamedTuple):
@@ -554,6 +561,8 @@ class SQLModelMypyPlugin(Plugin):
             return self._sqlmodel_select_return_type_callback
         if fullname == SQLMODEL_COL_FULLNAME:
             return self._sqlmodel_col_return_type_callback
+        if fullname in SQLALCHEMY_INSPECT_FULLNAMES:
+            return self._sqlalchemy_inspect_return_type_callback
         if fullname in SQLMODEL_TUPLE_FULLNAMES:
             return self._sqlmodel_tuple_return_type_callback
         if fullname == BUILTINS_GETATTR_FULLNAME:
@@ -1266,6 +1275,34 @@ class SQLModelMypyPlugin(Plugin):
                 return any(_contains_instance_fullname(item, fullname) for item in proper.items)
             return False
 
+        # Accept SQLAlchemy `Select[...]` in `Session.exec(...)`.
+        #
+        # SQLModel defines its own `Select[...]` wrapper class and types `Session.exec` to accept it,
+        # but users often import and use SQLAlchemy's `select()` directly. Runtime supports it, and
+        # with this adjustment we preserve a correctly-shaped `TupleResult[...]` return type.
+        sqlmodel_select_info = _lookup_typeinfo(self, SQLMODEL_SELECT_CLS_FULLNAME)
+        sqlalchemy_select_info = _lookup_typeinfo(self, SQLALCHEMY_SELECT_FULLNAME)
+        if sqlmodel_select_info is not None and sqlalchemy_select_info is not None:
+            if _contains_instance_fullname(default.arg_types[0], sqlmodel_select_info.fullname):
+                # Idempotency: if upstream stubs already accept SQLAlchemy Select, keep unchanged.
+                if not _contains_instance_fullname(
+                    default.arg_types[0], sqlalchemy_select_info.fullname
+                ):
+                    proper_arg0 = get_proper_type(default.arg_types[0])
+                    if isinstance(proper_arg0, Instance) and proper_arg0.args:
+                        row_type = proper_arg0.args[0]
+                    else:
+                        row_type = _plugin_any()
+                    sqlalchemy_select = Instance(
+                        sqlalchemy_select_info,
+                        [row_type] * len(sqlalchemy_select_info.defn.type_vars),
+                    )
+                    new_arg_types = list(default.arg_types)
+                    new_arg_types[0] = UnionType.make_union(
+                        [default.arg_types[0], sqlalchemy_select]
+                    )
+                    return default.copy_modified(arg_types=new_arg_types)
+
         # Only adjust the broad overload; keep Select/SelectOfScalar overloads precise.
         broad = False
         if sqlmodel_executable_info is not None and _contains_instance_fullname(
@@ -1751,6 +1788,48 @@ class SQLModelMypyPlugin(Plugin):
 
         return self._sqlalchemy_tuple_expr_type(ctx.api)
 
+    def _sqlalchemy_inspect_return_type_callback(self, ctx: FunctionContext) -> Type:
+        """Type `inspect(Model)` / `inspect(model)` for SQLModel table models.
+
+        SQLAlchemy's overloads for `inspect()` rely on the inspected object implementing typing-only
+        protocols (`_sa_inspect_type` / `_sa_inspect_instance`). SQLModel models are valid ORM entities
+        at runtime, but the required typing surface is not always present for strict type checkers.
+
+        Here we conservatively support the two common ORM introspection patterns:
+        - `inspect(User)` -> `Mapper[User]`
+        - `inspect(user)` -> `InstanceState[User]`
+        """
+        if not ctx.arg_types or not ctx.arg_types[0]:
+            return ctx.default_return_type
+
+        arg0 = get_proper_type(ctx.arg_types[0][0])
+
+        model_inst: Instance | None = None
+        is_type: bool = False
+        if isinstance(arg0, TypeType):
+            item = get_proper_type(arg0.item)
+            if isinstance(item, Instance):
+                model_inst = item
+                is_type = True
+        elif isinstance(arg0, Instance):
+            model_inst = arg0
+            is_type = False
+
+        if model_inst is None:
+            return ctx.default_return_type
+
+        info = model_inst.type
+        if info.fullname == SQLMODEL_BASEMODEL_FULLNAME:
+            return ctx.default_return_type
+        if not info.has_base(SQLMODEL_BASEMODEL_FULLNAME):
+            return ctx.default_return_type
+        if not _is_table_model(info):
+            return ctx.default_return_type
+
+        if is_type:
+            return self._sqlalchemy_mapper_type(ctx.api, model_inst)
+        return self._sqlalchemy_instance_state_type(ctx.api, model_inst)
+
     @staticmethod
     def _lookup_var_in_mro(info: TypeInfo, name: str) -> Var | None:
         """Find a `Var` named `name` in `info` or its MRO (best-effort)."""
@@ -1992,17 +2071,25 @@ class SQLModelMypyPlugin(Plugin):
         if not _is_table_model(info):
             return
 
-        if "__table__" in info.names:
-            return
+        if "__table__" not in info.names:
+            table_t = self._sqlalchemy_table_type(ctx.api)
+            v = Var("__table__", table_t)
+            v.info = info
+            v._fullname = f"{info.fullname}.__table__"
+            v.is_classvar = True
+            sym = SymbolTableNode(MDEF, v)
+            sym.plugin_generated = True
+            info.names["__table__"] = sym
 
-        table_t = self._sqlalchemy_table_type(ctx.api)
-        v = Var("__table__", table_t)
-        v.info = info
-        v._fullname = f"{info.fullname}.__table__"
-        v.is_classvar = True
-        sym = SymbolTableNode(MDEF, v)
-        sym.plugin_generated = True
-        info.names["__table__"] = sym
+        if "__mapper__" not in info.names:
+            mapper_t = self._sqlalchemy_mapper_type(ctx.api, fill_typevars(info))
+            v = Var("__mapper__", mapper_t)
+            v.info = info
+            v._fullname = f"{info.fullname}.__mapper__"
+            v.is_classvar = True
+            sym = SymbolTableNode(MDEF, v)
+            sym.plugin_generated = True
+            info.names["__mapper__"] = sym
 
     def _sqlalchemy_table_type(self, api: Any | None = None) -> Type:
         """Return the best available `sqlalchemy` Table-ish type.
@@ -2022,6 +2109,32 @@ class SQLModelMypyPlugin(Plugin):
             info = _lookup_typeinfo(self, fullname)
             if info is not None:
                 return Instance(info, [])
+        return _plugin_any()
+
+    def _sqlalchemy_mapper_type(self, api: Any | None, model_type: Type) -> Type:
+        """Return `sqlalchemy.orm.Mapper[model_type]` (best-effort)."""
+        for fullname in ("sqlalchemy.orm.Mapper", "sqlalchemy.orm.mapper.Mapper"):
+            if api is not None:
+                inst = _named_generic_type_or_none(api, fullname, [model_type])
+                if inst is not None:
+                    return inst
+            info = _lookup_typeinfo(self, fullname)
+            if info is not None:
+                args = [model_type] * len(info.defn.type_vars)
+                return Instance(info, args)
+        return _plugin_any()
+
+    def _sqlalchemy_instance_state_type(self, api: Any | None, model_type: Type) -> Type:
+        """Return `sqlalchemy.orm.InstanceState[model_type]` (best-effort)."""
+        for fullname in ("sqlalchemy.orm.InstanceState", "sqlalchemy.orm.state.InstanceState"):
+            if api is not None:
+                inst = _named_generic_type_or_none(api, fullname, [model_type])
+                if inst is not None:
+                    return inst
+            info = _lookup_typeinfo(self, fullname)
+            if info is not None:
+                args = [model_type] * len(info.defn.type_vars)
+                return Instance(info, args)
         return _plugin_any()
 
     def _widen_model_config_type(self, ctx: ClassDefContext) -> None:
