@@ -121,9 +121,11 @@ expressions, so you can write queries without `col()`:
 ```py
 from sqlmodel import Field, SQLModel, select
 
+
 class User(SQLModel, table=True):
     id: int = Field(primary_key=True)
     name: str = Field()
+
 
 stmt = select(User).where(User.name.like("%x%"))
 ```
