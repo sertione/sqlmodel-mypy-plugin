@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from types import SimpleNamespace
 
 from mypy.nodes import (
@@ -40,6 +41,9 @@ from sqlmodel_mypy.transform import (
     SQLModelRelationship,
     SQLModelTransformer,
     _callee_fullname,
+    _collect_sqlalchemy_marker_bindings,
+    _is_sqlalchemy_marker_source_module,
+    _is_sqlalchemy_module,
     _parse_annotated_field_metadata_by_line,
     add_method,
 )
@@ -296,6 +300,114 @@ def test_get_has_default_covers_common_cases() -> None:
     assert transformer.get_has_default(stmt) is False
 
 
+def test_get_has_default_covers_database_generated_columns() -> None:
+    cls = make_sqlmodel_class()
+    api = DummyAPI()
+    plugin_config = SimpleNamespace(
+        init_typed=False, init_forbid_extra=False, warn_untyped_fields=True
+    )
+    transformer = SQLModelTransformer(cls, None, api, plugin_config)  # type: ignore[arg-type]
+
+    def field_with_column(*, args: list[object], arg_names: list[str | None]) -> AssignmentStmt:
+        column = make_field_call(fullname="sqlalchemy.Column", args=args, arg_names=arg_names)
+        stmt = AssignmentStmt(
+            [NameExpr("x")],
+            make_field_call(
+                fullname=SQLMODEL_FIELD_FULLNAME,
+                args=[column],
+                arg_names=["sa_column"],
+            ),
+        )
+        stmt.new_syntax = True
+        return stmt
+
+    def marker(fullname: str) -> CallExpr:
+        return make_field_call(fullname=fullname, args=[StrExpr("s")], arg_names=[None])
+
+    true_expr = NameExpr("True")
+    true_expr.fullname = "builtins.True"
+    false_expr = NameExpr("False")
+    false_expr.fullname = "builtins.False"
+
+    # Positional SQLAlchemy schema constructs that install a (server) default -> optional.
+    for fullname in (
+        "sqlalchemy.sql.schema.Sequence",
+        "sqlalchemy.Sequence",
+        "sqlalchemy.sql.schema.Identity",
+        "sqlalchemy.sql.schema.FetchedValue",
+        "sqlalchemy.Computed",
+    ):
+        stmt = field_with_column(args=[marker(fullname)], arg_names=[None])
+        assert transformer.get_has_default(stmt) is True, fullname
+
+    # Same spelling, different library -> required. This is the `typing.Sequence` collision.
+    for fullname in (
+        "typing.Sequence",
+        "collections.abc.Sequence",
+        "mysqlalchemy.Sequence",
+        "myapp.helpers.Identity",
+    ):
+        stmt = field_with_column(args=[marker(fullname)], arg_names=[None])
+        assert transformer.get_has_default(stmt) is False, fullname
+
+    # An unresolved callee is not treated as a marker.
+    unresolved = CallExpr(NameExpr("Sequence"), [], [], [])
+    stmt = field_with_column(args=[unresolved], arg_names=[None])
+    assert transformer.get_has_default(stmt) is False
+
+    # `insert_default=` / `server_default=` -> optional.
+    for kwarg in ("insert_default", "server_default", "default"):
+        stmt = field_with_column(args=[StrExpr("x")], arg_names=[kwarg])
+        assert transformer.get_has_default(stmt) is True, kwarg
+
+    # `autoincrement=True` only counts on a primary key (SQLAlchemy ignores it elsewhere).
+    stmt = field_with_column(
+        args=[true_expr, true_expr], arg_names=["primary_key", "autoincrement"]
+    )
+    assert transformer.get_has_default(stmt) is True
+
+    stmt = field_with_column(args=[true_expr], arg_names=["autoincrement"])
+    assert transformer.get_has_default(stmt) is False
+
+    stmt = field_with_column(args=[true_expr], arg_names=["primary_key"])
+    assert transformer.get_has_default(stmt) is False
+
+    stmt = field_with_column(
+        args=[true_expr, false_expr], arg_names=["primary_key", "autoincrement"]
+    )
+    assert transformer.get_has_default(stmt) is False
+
+    # Same rule reached through `sa_column_kwargs={...}`.
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[
+                DictExpr(
+                    [
+                        (StrExpr("primary_key"), true_expr),
+                        (StrExpr("autoincrement"), true_expr),
+                    ]
+                )
+            ],
+            arg_names=["sa_column_kwargs"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert transformer.get_has_default(stmt) is True
+
+    stmt = AssignmentStmt(
+        [NameExpr("x")],
+        make_field_call(
+            fullname=SQLMODEL_FIELD_FULLNAME,
+            args=[DictExpr([(StrExpr("autoincrement"), true_expr)])],
+            arg_names=["sa_column_kwargs"],
+        ),
+    )
+    stmt.new_syntax = True
+    assert transformer.get_has_default(stmt) is False
+
+
 def test_get_field_aliases_covers_common_cases() -> None:
     # alias=...
     stmt = AssignmentStmt(
@@ -455,6 +567,184 @@ class Model(SQLModel):
     assert out[id_line] == (True, [])
     assert out[name_line] == (False, ["full_name"])
     assert out[v_line] == (True, ["a", "va"])
+
+
+def test_parse_annotated_field_metadata_by_line_is_import_aware_for_sequence() -> None:
+    """The `ast` reader must resolve markers through imports, not by bare name."""
+    template = """
+from typing import Annotated
+
+{imports}
+
+import sqlmodel
+
+
+class Model(sqlmodel.SQLModel):
+    x: Annotated[int, sqlmodel.Field(sa_column=Column("x", BigInteger, {marker}, nullable=False))]
+""".lstrip()
+
+    def has_default(imports: str, marker: str) -> bool:
+        src = template.format(imports=imports, marker=marker)
+        line = next(
+            i for i, text in enumerate(src.splitlines(), start=1) if text.strip().startswith("x:")
+        )
+        return _parse_annotated_field_metadata_by_line(src)[line][0]
+
+    sa_import = "from sqlalchemy import BigInteger, Column, Sequence"
+
+    # SQLAlchemy's `Sequence` -> `Column.default`, so the caller need not pass a value.
+    assert has_default(sa_import, 'Sequence("s")') is True
+    # `sqlmodel` re-exports the very same class.
+    assert has_default("from sqlmodel import BigInteger, Column, Sequence", 'Sequence("s")') is True
+    assert (
+        has_default(
+            "from sqlalchemy import BigInteger, Column, Sequence as SaSequence",
+            'SaSequence("s")',
+        )
+        is True
+    )
+    assert (
+        has_default(
+            "import sqlalchemy as sa\nfrom sqlalchemy import BigInteger, Column",
+            'sa.Sequence("s")',
+        )
+        is True
+    )
+    assert (
+        has_default(
+            "import sqlalchemy\nfrom sqlalchemy import BigInteger, Column",
+            'sqlalchemy.sql.schema.Sequence("s")',
+        )
+        is True
+    )
+
+    # `Sequence` bound to something else must not qualify.
+    assert (
+        has_default(
+            "from typing import Sequence\nfrom sqlalchemy import BigInteger, Column",
+            'Sequence("s")',
+        )
+        is False
+    )
+    assert (
+        has_default(
+            "from collections.abc import Sequence\nfrom sqlalchemy import BigInteger, Column",
+            'Sequence("s")',
+        )
+        is False
+    )
+    assert (
+        has_default(
+            "from myapp.helpers import Computed\nfrom sqlalchemy import BigInteger, Column",
+            'Computed("1")',
+        )
+        is False
+    )
+    # Not imported at all -> we cannot tell, so stay conservative.
+    assert has_default("from sqlalchemy import BigInteger, Column", 'Sequence("s")') is False
+
+    # Other positional markers.
+    assert (
+        has_default("from sqlalchemy import BigInteger, Column, Identity", "Identity(always=True)")
+        is True
+    )
+    assert (
+        has_default("from sqlalchemy import BigInteger, Column, FetchedValue", "FetchedValue()")
+        is True
+    )
+
+
+def test_parse_annotated_field_metadata_by_line_covers_autoincrement_and_insert_default() -> None:
+    src = """
+from typing import Annotated
+
+import sqlmodel
+from sqlalchemy import Column, Integer
+
+
+class Model(sqlmodel.SQLModel):
+    a: Annotated[int, sqlmodel.Field(sa_column=Column("a", Integer, insert_default=1))]
+    b: Annotated[int, sqlmodel.Field(sa_column=Column("b", Integer, primary_key=True, autoincrement=True))]
+    c: Annotated[int, sqlmodel.Field(sa_column=Column("c", Integer, autoincrement=True))]
+    d: Annotated[int, sqlmodel.Field(sa_column=Column("d", Integer, primary_key=True))]
+    e: Annotated[int, sqlmodel.Field(sa_column_kwargs={"primary_key": True, "autoincrement": True})]
+    f: Annotated[int, sqlmodel.Field(sa_column_kwargs={"autoincrement": True})]
+""".lstrip()
+
+    out = _parse_annotated_field_metadata_by_line(src)
+    lines = src.splitlines()
+
+    def ln(prefix: str) -> int:
+        return next(i for i, line in enumerate(lines, start=1) if line.strip().startswith(prefix))
+
+    assert out[ln("a:")] == (True, [])
+    assert out[ln("b:")] == (True, [])
+    assert out[ln("c:")] == (False, [])
+    assert out[ln("d:")] == (False, [])
+    assert out[ln("e:")] == (True, [])
+    assert out[ln("f:")] == (False, [])
+
+
+def test_sqlalchemy_marker_module_helpers() -> None:
+    assert _is_sqlalchemy_module("sqlalchemy") is True
+    assert _is_sqlalchemy_module("sqlalchemy.sql.schema") is True
+    assert _is_sqlalchemy_module("sqlalchemy_utils") is False
+    assert _is_sqlalchemy_module("sqlmodel") is False
+    assert _is_sqlalchemy_module("") is False
+    assert _is_sqlalchemy_module(None) is False
+
+    assert _is_sqlalchemy_marker_source_module("sqlmodel") is True
+    assert _is_sqlalchemy_marker_source_module("sqlalchemy.schema") is True
+    assert _is_sqlalchemy_marker_source_module("typing") is False
+    assert _is_sqlalchemy_marker_source_module(None) is False
+
+
+def test_parse_annotated_field_metadata_by_line_ignores_non_dotted_callees() -> None:
+    """A positional argument we cannot name is never treated as a marker."""
+    src = """
+from typing import Annotated
+
+import sqlmodel
+from sqlalchemy import BigInteger, Column, Sequence
+
+
+class Model(sqlmodel.SQLModel):
+    a: Annotated[int, sqlmodel.Field(sa_column=Column("a", BigInteger, MAKERS[0]("s")))]
+    b: Annotated[int, sqlmodel.Field(sa_column=BigInteger)]
+    c: Annotated[int, sqlmodel.Field(sa_column=Sequence("s"))]
+    d: Annotated[int, sqlmodel.Field(sa_column_kwargs=1)]
+""".lstrip()
+
+    out = _parse_annotated_field_metadata_by_line(src)
+    lines = src.splitlines()
+
+    def ln(prefix: str) -> int:
+        return next(i for i, line in enumerate(lines, start=1) if line.strip().startswith(prefix))
+
+    assert out[ln("a:")] == (False, [])
+    assert out[ln("b:")] == (False, [])
+    assert out[ln("c:")] == (False, [])
+    assert out[ln("d:")] == (False, [])
+
+
+def test_collect_sqlalchemy_marker_bindings() -> None:
+    tree = ast.parse(
+        """
+import sqlalchemy
+import sqlalchemy.orm as so
+import sqlalchemy.sql
+import os
+from sqlalchemy import Sequence, Column
+from sqlalchemy.sql.schema import Identity as Ident
+from sqlmodel import FetchedValue
+from typing import Sequence as TypingSequence
+from .local import Computed
+""".lstrip()
+    )
+
+    marker_names, module_aliases = _collect_sqlalchemy_marker_bindings(tree)
+    assert marker_names == {"Sequence", "Ident", "FetchedValue"}
+    assert module_aliases == {"sqlalchemy", "so"}
 
 
 def test_parse_annotated_field_metadata_by_line_covers_defaultish_hints_and_union_syntax() -> None:

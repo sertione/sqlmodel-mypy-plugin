@@ -182,6 +182,35 @@ stmt = select(Team).where(Team.heroes.contains(hero_obj))
 - **SQLAlchemy typing**: relied upon for core SQL/ORM typing wherever possible.
 - **Stub overlays**: only for upstream gaps that can’t be addressed cleanly via hooks (prefer upstream fixes first).
 
+## Database-generated columns are optional kwargs
+
+A field whose value the database (or SQLAlchemy) supplies on INSERT is not required in the generated
+`__init__` / `model_construct` signature. The plugin reads this off `Field(...)` syntactically, from
+`nullable=True`, `sa_column=Column(...)` and `sa_column_kwargs={...}`:
+
+| Form | Why it counts |
+| --- | --- |
+| `nullable=True` | column accepts `NULL` |
+| `default=` / `insert_default=` / `server_default=` (incl. `server_default=FetchedValue()`) | an explicit default |
+| positional `Computed(...)` | `GENERATED ALWAYS AS`, computed by the database |
+| positional `Sequence(...)` | becomes `Column.default`, identical to `default=Sequence(...)` |
+| positional `Identity(...)` | becomes `Column.server_default` (`GENERATED ... AS IDENTITY`) |
+| positional `FetchedValue()` | becomes `Column.server_default` |
+| `primary_key=True` **and** `autoincrement=True` | renders as `SERIAL`/`IDENTITY` |
+
+Markers are matched by their resolved module, so `Sequence` imported from `typing` or
+`collections.abc` is never mistaken for `sqlalchemy.Sequence`; `sqlmodel` re-exports of these
+constructs are recognized. A name the plugin cannot trace back to SQLAlchemy is left alone.
+
+Deliberately **not** covered:
+
+- a bare `primary_key=True`. SQLAlchemy's default `autoincrement="auto"` only generates a value for
+  a *single-column integer* primary key, and neither the column type nor the rest of the table's
+  primary key is knowable from one `Column(...)` call — composite or non-integer primary keys would
+  silently become optional. Use SQLModel's usual `Field(default=None, primary_key=True)`.
+- `autoincrement=True` **without** `primary_key=True`. SQLAlchemy ignores it there (the column
+  compiles to a plain `INTEGER`), so the value really is caller-supplied.
+
 ## Field aliases in constructor kwargs
 
 If you use `Field(alias=...)` (or `validation_alias=...` / `schema_extra={"validation_alias": ...}`), the plugin

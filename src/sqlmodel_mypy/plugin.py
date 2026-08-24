@@ -171,7 +171,7 @@ SQLALCHEMY_INSPECT_FULLNAMES = {
 }
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 26
+__version__ = 27
 
 
 class _CollectedField(NamedTuple):

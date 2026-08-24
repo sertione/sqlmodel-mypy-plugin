@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from sqlalchemy import Column, Computed, String, text
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Computed,
+    FetchedValue,
+    Identity,
+    Integer,
+    Sequence,
+    String,
+    text,
+)
 from sqlmodel import Field, SQLModel
 
 
@@ -24,3 +34,56 @@ class Model(SQLModel, table=True):
 
 Model()
 Model(required="x")
+
+
+class GeneratedDefaults(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+
+    required: str = Field()
+
+    # Positional `Sequence(...)` becomes `Column.default`, exactly like `default=Sequence(...)`.
+    seq_number: int = Field(
+        sa_column=Column(
+            "seq_number",
+            BigInteger,
+            Sequence("generated_defaults_seq_number_seq", start=1, increment=1),
+            index=True,
+            nullable=False,
+        )
+    )
+
+    # Positional `Identity(...)` becomes `Column.server_default` (GENERATED ... AS IDENTITY).
+    identity_number: int = Field(
+        sa_column=Column("identity_number", Integer, Identity(always=True))
+    )
+
+    # Positional `FetchedValue()` becomes `Column.server_default`.
+    fetched: str = Field(sa_column=Column("fetched", String(), FetchedValue()))
+
+    fetched_kw: str = Field(sa_column=Column("fetched_kw", String(), server_default=FetchedValue()))
+
+    inserted: str = Field(sa_column=Column("inserted", String(), insert_default="x"))
+
+
+GeneratedDefaults()
+GeneratedDefaults(required="x")
+
+
+class AutoIncrementPk(SQLModel, table=True):
+    # `autoincrement=True` on a primary key renders as SERIAL/IDENTITY: value comes from the DB.
+    auto_pk: int = Field(sa_column=Column("auto_pk", Integer, primary_key=True, autoincrement=True))
+
+
+AutoIncrementPk()
+
+
+class ManualPk(SQLModel, table=True):
+    # A bare `primary_key=True` says nothing about who supplies the value.
+    manual_pk: int = Field(sa_column=Column("manual_pk", Integer, primary_key=True))
+
+    # `autoincrement=True` off a primary key is ignored by SQLAlchemy (plain INTEGER column).
+    counter: int = Field(sa_column=Column("counter", Integer, autoincrement=True))
+
+
+ManualPk()
+ManualPk(manual_pk=1, counter=0)

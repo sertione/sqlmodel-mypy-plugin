@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import ast
 import keyword
-from collections.abc import Iterator
-from typing import Any, Protocol
+from collections.abc import Callable, Iterable, Iterator
+from typing import Any, Protocol, TypeVar
 
 from mypy.errorcodes import ErrorCode
 from mypy.expandtype import expand_type
@@ -85,6 +85,19 @@ SQLMODEL_RELATIONSHIP_FULLNAME = "sqlmodel.main.Relationship"
 
 SQLALCHEMY_MAPPED_FULLNAMES = {"sqlalchemy.orm.Mapped", "sqlalchemy.orm.base.Mapped"}
 
+# `Column(...)` keywords whose presence means the value does not have to be supplied by the caller.
+# All of them end up as `Column.default` / `Column.server_default`, i.e. the value is produced by
+# SQLAlchemy or by the database on INSERT.
+SQLALCHEMY_DEFAULTISH_COLUMN_KWARGS = frozenset({"server_default", "default", "insert_default"})
+
+# SQLAlchemy schema constructs that are passed to `Column(...)` *positionally* and install a
+# default/server-default on the column via `SchemaEventTarget._set_parent`:
+# - `Computed(...)`     -> GENERATED ALWAYS AS, value is computed by the database
+# - `Sequence(...)`     -> becomes `Column.default` (identical to `default=Sequence(...)`)
+# - `Identity(...)`     -> becomes `Column.server_default` (GENERATED ... AS IDENTITY)
+# - `FetchedValue()`    -> becomes `Column.server_default` (value fetched after INSERT)
+SQLALCHEMY_COLUMN_DEFAULT_MARKERS = frozenset({"Computed", "Sequence", "Identity", "FetchedValue"})
+
 
 def _plugin_any() -> AnyType:
     """Return an Any that should not trigger `disallow_any_explicit`."""
@@ -92,6 +105,109 @@ def _plugin_any() -> AnyType:
 
 
 ERROR_FIELD = ErrorCode("sqlmodel-field", "SQLModel field error", "SQLModel")
+
+
+_ExprT = TypeVar("_ExprT")
+
+
+def _is_sqlalchemy_module(module: str | None) -> bool:
+    """True for `sqlalchemy` and any of its submodules."""
+    if not module:
+        return False
+    return module.split(".", 1)[0] == "sqlalchemy"
+
+
+def _is_sqlalchemy_marker_source_module(module: str | None) -> bool:
+    """Modules an import may legitimately pull a SQLAlchemy default marker out of.
+
+    `sqlmodel/__init__.py` re-exports `Computed` / `Sequence` / `Identity` / `FetchedValue`
+    straight from `sqlalchemy.schema` (`from sqlalchemy.schema import X as X`), so
+    `from sqlmodel import Sequence` binds the very same class.
+    """
+    if not module:
+        return False
+    return module.split(".", 1)[0] in {"sqlalchemy", "sqlmodel"}
+
+
+def _column_args_are_defaultish(
+    args: Iterable[tuple[str | None, _ExprT]],
+    *,
+    is_marker_call: Callable[[_ExprT], bool],
+    is_true: Callable[[_ExprT], bool],
+    is_none: Callable[[_ExprT], bool],
+) -> bool:
+    """Shared `Column(...)` rule: does this column get its value without the caller supplying one?
+
+    `args` is the argument list normalised to `(keyword_name_or_None, value)` pairs, so the same
+    rule can be driven both from raw `ast` nodes (`Annotated[...]` metadata) and from mypy
+    `Expression` nodes (`x: T = Field(...)`), and from `sa_column_kwargs={...}` dicts (which only
+    ever produce keyword entries).
+
+    Deliberately *not* covered: a bare `primary_key=True`. SQLAlchemy's default
+    `autoincrement="auto"` only generates a value for a *single-column integer* primary key, and
+    neither the column type nor the rest of the table's primary key is knowable from one
+    `Column(...)` call, so composite or non-integer primary keys would silently become optional.
+    An explicit `autoincrement=True` *on a primary key* is different: it is the author stating that
+    the database generates the value, it renders as SERIAL/IDENTITY, and SQLAlchemy rejects it at
+    DDL time on an incompatible column type.
+    """
+    saw_autoincrement_true = False
+    saw_primary_key_true = False
+
+    for arg_name, arg in args:
+        if arg_name is None:
+            # Positional schema constructs, e.g. `Column(BigInteger, Sequence("s"))`.
+            if is_marker_call(arg):
+                return True
+            continue
+
+        if arg_name == "nullable" and is_true(arg):
+            return True
+        if arg_name in SQLALCHEMY_DEFAULTISH_COLUMN_KWARGS and not is_none(arg):
+            return True
+        if arg_name == "autoincrement" and is_true(arg):
+            saw_autoincrement_true = True
+        elif arg_name == "primary_key" and is_true(arg):
+            saw_primary_key_true = True
+
+    return saw_autoincrement_true and saw_primary_key_true
+
+
+def _ast_dotted_name(expr: ast.expr) -> str | None:
+    """Flatten `a.b.C` into `"a.b.C"`; return None for anything that is not a plain dotted name."""
+    if isinstance(expr, ast.Name):
+        return expr.id
+    if isinstance(expr, ast.Attribute):
+        base = _ast_dotted_name(expr.value)
+        return None if base is None else f"{base}.{expr.attr}"
+    return None
+
+
+def _collect_sqlalchemy_marker_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """Return `(marker names, module aliases)` bound by the module's imports.
+
+    Import-aware on purpose: `Sequence` is also `typing.Sequence` / `collections.abc.Sequence`, so
+    matching the bare name would misread `x: Sequence[int]`-style code as a SQLAlchemy sequence.
+    Names we cannot trace back to a `sqlalchemy` / `sqlmodel` import are not treated as markers.
+    """
+    marker_names: set[str] = set()
+    module_aliases: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if not _is_sqlalchemy_marker_source_module(alias.name):
+                    continue
+                # `import sqlalchemy.orm` binds the top-level package name.
+                module_aliases.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or not _is_sqlalchemy_marker_source_module(node.module):
+                continue
+            for alias in node.names:
+                if alias.name in SQLALCHEMY_COLUMN_DEFAULT_MARKERS:
+                    marker_names.add(alias.asname or alias.name)
+
+    return marker_names, module_aliases
 
 
 def _parse_annotated_field_metadata_by_line(source: str) -> dict[int, tuple[bool, list[str]]]:
@@ -103,6 +219,13 @@ def _parse_annotated_field_metadata_by_line(source: str) -> dict[int, tuple[bool
 
     Only handles class-body `AnnAssign` nodes with **no assignment value** (i.e. `x: ...`).
     """
+    out: dict[int, tuple[bool, list[str]]] = {}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return out
+
+    marker_names, sqlalchemy_module_aliases = _collect_sqlalchemy_marker_bindings(tree)
 
     def _call_func_name(expr: ast.expr) -> str | None:
         if isinstance(expr, ast.Name):
@@ -175,6 +298,20 @@ def _parse_annotated_field_metadata_by_line(source: str) -> dict[int, tuple[bool
             aliases.append(candidate)
         return aliases
 
+    def _is_marker_call(expr: ast.expr) -> bool:
+        if not isinstance(expr, ast.Call):
+            return False
+        name = _ast_dotted_name(expr.func)
+        if name is None:
+            return False
+        head, _, attr = name.rpartition(".")
+        if not head:
+            return name in marker_names
+        return (
+            attr in SQLALCHEMY_COLUMN_DEFAULT_MARKERS
+            and head.split(".", 1)[0] in sqlalchemy_module_aliases
+        )
+
     def _column_expr_is_defaultish(expr: ast.expr) -> bool:
         if not isinstance(expr, ast.Call):
             return False
@@ -183,32 +320,29 @@ def _parse_annotated_field_metadata_by_line(source: str) -> dict[int, tuple[bool
         if callee_name is not None and not callee_name.endswith("Column"):
             return False
 
-        for arg in expr.args:
-            if isinstance(arg, ast.Call):
-                computed_name = _call_func_name(arg.func)
-                if computed_name is not None and computed_name.endswith("Computed"):
-                    return True
-
-        for kw in expr.keywords:
-            if kw.arg == "nullable" and _is_true(kw.value):
-                return True
-            if kw.arg in {"server_default", "default", "insert_default"} and not _is_none(kw.value):
-                return True
-        return False
+        args: list[tuple[str | None, ast.expr]] = [(None, arg) for arg in expr.args]
+        args += [(kw.arg, kw.value) for kw in expr.keywords if kw.arg is not None]
+        return _column_args_are_defaultish(
+            args,
+            is_marker_call=_is_marker_call,
+            is_true=_is_true,
+            is_none=_is_none,
+        )
 
     def _sa_column_kwargs_are_defaultish(expr: ast.expr) -> bool:
         if not isinstance(expr, ast.Dict):
             return False
-        for key_expr, val_expr in zip(expr.keys, expr.values, strict=True):
-            if not (isinstance(key_expr, ast.Constant) and isinstance(key_expr.value, str)):
-                continue
-            if key_expr.value == "nullable" and _is_true(val_expr):
-                return True
-            if key_expr.value in {"server_default", "default", "insert_default"} and not _is_none(
-                val_expr
-            ):
-                return True
-        return False
+        items: list[tuple[str | None, ast.expr]] = [
+            (key_expr.value, val_expr)
+            for key_expr, val_expr in zip(expr.keys, expr.values, strict=True)
+            if isinstance(key_expr, ast.Constant) and isinstance(key_expr.value, str)
+        ]
+        return _column_args_are_defaultish(
+            items,
+            is_marker_call=_is_marker_call,
+            is_true=_is_true,
+            is_none=_is_none,
+        )
 
     def _field_has_default_from_call(call: ast.Call) -> bool:
         # Explicit default always wins.
@@ -262,12 +396,6 @@ def _parse_annotated_field_metadata_by_line(source: str) -> dict[int, tuple[bool
                         return found
 
         return None
-
-    out: dict[int, tuple[bool, list[str]]] = {}
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return out
 
     class _Visitor(ast.NodeVisitor):
         def __init__(self) -> None:
@@ -717,10 +845,8 @@ class SQLModelTransformer:
             def _column_expr_is_defaultish(value: Expression) -> bool:
                 """Best-effort detection of SQLAlchemy-generated/defaultable columns.
 
-                We treat these as "optional" constructor kwargs:
-                - nullable=True
-                - server_default / default / insert_default
-                - Computed(...) columns
+                Shares `_column_args_are_defaultish` with the `Annotated[...]` `ast` reader; see
+                that function for what counts as "the caller need not supply this value".
                 """
                 if not isinstance(value, CallExpr):
                     return False
@@ -730,38 +856,28 @@ class SQLModelTransformer:
                     # Be conservative: avoid interpreting non-Column calls.
                     return False
 
-                for c_arg, c_arg_name in zip(value.args, value.arg_names, strict=True):
-                    # Positional Computed(...) (common in declarative).
-                    if c_arg_name is None and isinstance(c_arg, CallExpr):
-                        computed_fullname = _callee_fullname(c_arg)
-                        if computed_fullname is not None and computed_fullname.endswith(
-                            ".Computed"
-                        ):
-                            return True
-
-                    # Keyword hints.
-                    if c_arg_name == "nullable" and _is_bool_nameexpr(c_arg, True):
-                        return True
-                    if c_arg_name in {"server_default", "default", "insert_default"}:
-                        if not _is_none_expr(c_arg):
-                            return True
-
-                return False
+                return _column_args_are_defaultish(
+                    zip(value.arg_names, value.args, strict=True),
+                    is_marker_call=_is_sqlalchemy_marker_call,
+                    is_true=lambda e: _is_bool_nameexpr(e, True),
+                    is_none=_is_none_expr,
+                )
 
             def _sa_column_kwargs_are_defaultish(value: Expression) -> bool:
                 """Best-effort for `Field(sa_column_kwargs={...})`."""
                 if not isinstance(value, DictExpr):
                     return False
 
-                for key_expr, val_expr in value.items:
-                    if not isinstance(key_expr, StrExpr):
-                        continue
-                    if key_expr.value == "nullable" and _is_bool_nameexpr(val_expr, True):
-                        return True
-                    if key_expr.value in {"server_default", "default", "insert_default"}:
-                        if not _is_none_expr(val_expr):
-                            return True
-                return False
+                return _column_args_are_defaultish(
+                    [
+                        (key_expr.value, val_expr)
+                        for key_expr, val_expr in value.items
+                        if isinstance(key_expr, StrExpr)
+                    ],
+                    is_marker_call=_is_sqlalchemy_marker_call,
+                    is_true=lambda e: _is_bool_nameexpr(e, True),
+                    is_none=_is_none_expr,
+                )
 
             saw_nullable_true = False
             sa_column_expr: Expression | None = None
@@ -1055,6 +1171,21 @@ def _callee_fullname(call: CallExpr) -> str | None:
     if isinstance(callee, RefExpr):
         return callee.fullname
     return None
+
+
+def _is_sqlalchemy_marker_call(value: Expression) -> bool:
+    """True for a call to a SQLAlchemy schema construct that installs a column default.
+
+    Matching is by resolved fullname, so `Sequence` imported from `typing` /
+    `collections.abc` does not qualify. An unresolved callee is not treated as a marker.
+    """
+    if not isinstance(value, CallExpr):
+        return False
+    fullname = _callee_fullname(value)
+    if fullname is None:
+        return False
+    module, _, attr = fullname.rpartition(".")
+    return attr in SQLALCHEMY_COLUMN_DEFAULT_MARKERS and _is_sqlalchemy_module(module)
 
 
 def _unwrap_mapped_type(typ: Type) -> Type:
