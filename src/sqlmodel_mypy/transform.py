@@ -448,8 +448,9 @@ class ForceInvariantTypeVars(TypeTranslator):
         return modified
 
     def visit_type_alias_type(self, t: TypeAliasType) -> Type:  # noqa: D102
-        # Expand type aliases and then continue translation.
-        return get_proper_type(t).accept(self)
+        # Alias targets can refer back to themselves. Preserve their graph and
+        # translate only the supplied arguments, like mypy's ExpandTypeVisitor.
+        return t.copy_modified(args=[arg.accept(self) for arg in t.args])
 
 
 class SQLModelField:

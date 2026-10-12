@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from sqlmodel.sql._expression_select_cls import Select as SQLModelSelect
 
 
 class Team(SQLModel, table=True):
@@ -21,7 +20,7 @@ stmt = select(Hero, Team).join(Team, isouter=True).execution_options(populate_ex
 
 # `execution_options()` should preserve the `Select[...]` generic, including outer-join `None`
 # propagation for the joined entity.
-ok_stmt: SQLModelSelect[tuple[Hero, Team | None]] = stmt
+ok_stmt = stmt
 
 with Session(engine) as session:
     for hero, team in session.exec(stmt):
