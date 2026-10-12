@@ -543,10 +543,12 @@ def test_model_construct_signature_hook_includes_relationship_kwargs_for_table_m
     assert sig.arg_kinds[:3] == [ARG_OPT, ARG_NAMED, ARG_NAMED_OPT]
 
 
-def test_select_signature_hook_supports_more_than_4_entities() -> None:
+@pytest.mark.parametrize("variadic", [False, True])
+def test_select_signature_hook_supports_more_than_4_entities(variadic: bool) -> None:
     p = plugin_mod.SQLModelMypyPlugin(Options())
 
     select_info = make_typeinfo("sqlalchemy.sql.selectable.Select")
+    select_info.has_type_var_tuple_type = variadic
     p.lookup_fully_qualified = lambda full: (  # type: ignore[method-assign]
         SimpleNamespace(node=select_info) if full == "sqlalchemy.sql.selectable.Select" else None
     )
@@ -575,12 +577,17 @@ def test_select_signature_hook_supports_more_than_4_entities() -> None:
     assert isinstance(ret, Instance)
     assert ret.type.fullname == "sqlalchemy.sql.selectable.Select"
     assert ret.args
-    row = get_proper_type(ret.args[0])
+    row = (
+        TupleType(list(ret.args), api.named_generic_type("builtins.tuple", []))
+        if variadic
+        else get_proper_type(ret.args[0])
+    )
     assert isinstance(row, TupleType)
     assert len(row.items) == 5
 
 
-def test_select_return_type_callback_recovers_tuple_item_types_for_5plus() -> None:
+@pytest.mark.parametrize("variadic", [False, True])
+def test_select_return_type_callback_recovers_tuple_item_types_for_5plus(variadic: bool) -> None:
     p = plugin_mod.SQLModelMypyPlugin(Options())
     api = DummyCheckerAPI()
 
@@ -588,11 +595,13 @@ def test_select_return_type_callback_recovers_tuple_item_types_for_5plus() -> No
     team_info = make_typeinfo("m.Team")
     select_info = make_typeinfo(plugin_mod.SQLMODEL_SELECT_CLS_FULLNAME)
 
+    select_info.has_type_var_tuple_type = variadic
+
     any_t = AnyType(TypeOfAny.explicit)
     tuple_info = make_typeinfo("builtins.tuple")
     tuple_fallback = Instance(tuple_info, [any_t])
     default_row = TupleType([any_t, any_t, any_t, any_t, any_t], tuple_fallback)
-    default_return = Instance(select_info, [default_row])
+    default_return = Instance(select_info, default_row.items if variadic else [default_row])
 
     int_t = Instance(make_typeinfo("builtins.int"), [])
     str_t = Instance(make_typeinfo("builtins.str"), [])
@@ -637,7 +646,11 @@ def test_select_return_type_callback_recovers_tuple_item_types_for_5plus() -> No
     assert isinstance(proper, Instance)
     assert proper.type.fullname == plugin_mod.SQLMODEL_SELECT_CLS_FULLNAME
     assert proper.args
-    row = get_proper_type(proper.args[0])
+    row = (
+        TupleType(list(proper.args), tuple_fallback)
+        if variadic
+        else get_proper_type(proper.args[0])
+    )
     assert isinstance(row, TupleType)
     assert len(row.items) == 5
     assert isinstance(get_proper_type(row.items[0]), Instance)
@@ -650,7 +663,10 @@ def test_select_return_type_callback_recovers_tuple_item_types_for_5plus() -> No
     assert get_proper_type(row.items[4]).type.fullname == "builtins.str"  # type: ignore[union-attr]
 
 
-def test_select_join_isouter_true_makes_joined_entity_optional_in_return_type() -> None:
+@pytest.mark.parametrize("variadic", [False, True])
+def test_select_join_isouter_true_makes_joined_entity_optional_in_return_type(
+    variadic: bool,
+) -> None:
     p = plugin_mod.SQLModelMypyPlugin(Options())
 
     hero_info = make_typeinfo("m.Hero")
@@ -661,7 +677,8 @@ def test_select_join_isouter_true_makes_joined_entity_optional_in_return_type() 
     tp = TupleType([Instance(hero_info, []), Instance(team_info, [])], fallback)
 
     select_info = make_typeinfo("sqlalchemy.sql.selectable.Select")
-    select_inst = Instance(select_info, [tp])
+    select_info.has_type_var_tuple_type = variadic
+    select_inst = Instance(select_info, tp.items if variadic else [tp])
 
     team_expr = NameExpr("Team")
     team_expr.node = team_info
@@ -697,7 +714,7 @@ def test_select_join_isouter_true_makes_joined_entity_optional_in_return_type() 
     assert isinstance(proper, Instance)
     assert proper.type.fullname == "sqlalchemy.sql.selectable.Select"
     assert proper.args
-    tp2 = get_proper_type(proper.args[0])
+    tp2 = TupleType(list(proper.args), fallback) if variadic else get_proper_type(proper.args[0])
     assert isinstance(tp2, TupleType)
     assert len(tp2.items) == 2
     assert isinstance(get_proper_type(tp2.items[0]), Instance)
@@ -2469,13 +2486,17 @@ def test_field_signature_hook_widens_validation_alias_and_sa_type() -> None:
     )
 
 
-def test_session_execute_method_hook_types_select_results_when_enabled() -> None:
+@pytest.mark.parametrize("variadic", [False, True])
+def test_session_execute_method_hook_types_select_results_when_enabled(variadic: bool) -> None:
     options = Options()
     options.config_file = None
     p = plugin_mod.SQLModelMypyPlugin(options)
     p.plugin_config.typed_execute = True
 
     api = DummyCheckerAPI()
+    result_info = make_typeinfo("sqlalchemy.engine.Result")
+    result_info.has_type_var_tuple_type = variadic
+    api._infos["sqlalchemy.engine.Result"] = result_info
     hero_info = make_typeinfo("m.Hero")
 
     # `select(Hero)` is typically a SelectOfScalar[Hero].
@@ -2499,7 +2520,11 @@ def test_session_execute_method_hook_types_select_results_when_enabled() -> None
     assert isinstance(proper, Instance)
     assert proper.type.fullname == "sqlalchemy.engine.Result"
     assert proper.args
-    row = get_proper_type(proper.args[0])
+    row = (
+        TupleType(list(proper.args), api.named_generic_type("builtins.tuple", []))
+        if variadic
+        else get_proper_type(proper.args[0])
+    )
     assert isinstance(row, TupleType)
     assert len(row.items) == 1
 
@@ -2527,6 +2552,8 @@ def test_session_execute_method_hook_types_select_results_when_enabled() -> None
     inner = get_proper_type(proper2.args[2])
     assert isinstance(inner, Instance)
     assert inner.type.fullname == "sqlalchemy.engine.Result"
+
+    assert inner.args == proper.args
 
 
 def test_call_get_positional_returns_none_for_out_of_range() -> None:

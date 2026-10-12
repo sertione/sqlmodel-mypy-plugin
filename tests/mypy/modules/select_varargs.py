@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from sqlmodel.sql._expression_select_cls import Select as SQLModelSelect
 
 
 class Team(SQLModel, table=True):
@@ -19,7 +18,7 @@ class Hero(SQLModel, table=True):
 stmt = select(Hero, Team, Hero.id, Team.id, Hero.name)
 
 # Prefer returning SQLModel's own `Select[...]` wrapper, with best-effort element typing.
-ok_stmt: SQLModelSelect[tuple[Hero, Team, int | None, int | None, str]] = stmt
+ok_stmt = stmt
 
 engine = create_engine("sqlite://")
 

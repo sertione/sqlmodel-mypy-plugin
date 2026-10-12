@@ -6,6 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import pytest
+import sqlalchemy
 
 try:
     from mypy import api as mypy_api
@@ -14,6 +15,9 @@ except ImportError:  # pragma: no cover
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUTS_DIR = REPO_ROOT / "tests/mypy/outputs"
+# SQLAlchemy 2.1 changes generic spellings in diagnostics. Reuse unchanged
+# expectations and keep only the differing outputs in a versioned directory.
+VARIADIC_ROWS = tuple(int(part) for part in sqlalchemy.__version__.split(".")[:2]) >= (2, 1)
 
 # Ensure mypy can find the test files regardless of invocation cwd.
 os.chdir(REPO_ROOT)
@@ -86,6 +90,11 @@ cases: list[tuple[str, str]] = [
     ("mypy-plugin-strict.ini", "annotated_field_metadata.py"),
     ("mypy-plugin-strict.ini", "tuple_expression.py"),
 ]
+
+
+# SQLAlchemy 2.1's variadic row API is exercised through both ORM and Core.
+if VARIADIC_ROWS:
+    cases.append(("mypy-plugin-strict.ini", "row_generics.py"))
 
 
 def get_expected_return_code(source_code: str) -> int:
@@ -182,15 +191,31 @@ def test_mypy_results(config_filename: str, request: pytest.FixtureRequest) -> N
         file_mypy_out = re.sub(r"\n\s*\n", r"\n", file_mypy_out).strip()
 
         input_code = input_path.read_text()
-        output_path = output_dir / input_path.name
-        existing_output_code: str | None = (
-            output_path.read_text() if output_path.is_file() else None
-        )
+        if input_path.name == "row_generics.py":
+            expected_error_lines = {
+                number
+                for number, line in enumerate(input_code.splitlines(), 1)
+                if line.strip().startswith("bad_")
+            }
+            actual_error_lines = {
+                int(match.group(1))
+                for line in file_mypy_out.splitlines()
+                if (match := re.match(r"(\d+)(?::\d+)?: error:", line))
+            }
+            assert actual_error_lines == expected_error_lines, file_mypy_out
+        legacy_path = output_dir / input_path.name
+        output_path = legacy_path
+        if VARIADIC_ROWS:
+            output_path = OUTPUTS_DIR / "sqlalchemy-2.1" / output_dir.name / input_path.name
+        legacy_output = legacy_path.read_text() if legacy_path.is_file() else None
+        existing_output_code = output_path.read_text() if output_path.is_file() else legacy_output
         expected_output = existing_output_code or input_code
 
         merged_output = merge_python_and_mypy_output(input_code, file_mypy_out)
 
-        if merged_output != expected_output:
+        if update_mypy and VARIADIC_ROWS and merged_output == (legacy_output or input_code):
+            output_path.unlink(missing_ok=True)
+        elif merged_output != expected_output:
             if update_mypy:
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 output_path.write_text(merged_output)

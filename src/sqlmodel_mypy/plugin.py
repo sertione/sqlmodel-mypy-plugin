@@ -58,6 +58,7 @@ from mypy.types import (
     TypeOfAny,
     TypeType,
     UnionType,
+    UnpackType,
     get_proper_type,
 )
 from mypy.typevars import fill_typevars
@@ -171,7 +172,7 @@ SQLALCHEMY_INSPECT_FULLNAMES = {
 }
 
 # Increment when plugin changes should invalidate mypy cache.
-__version__ = 27
+__version__ = 28
 
 
 class _CollectedField(NamedTuple):
@@ -926,7 +927,7 @@ class SQLModelMypyPlugin(Plugin):
 
         SQLModel's generated stubs traditionally cap `select()` overloads at 4 entities.
         For 5+ entities, fall back to a conservative signature that accepts the call and
-        returns `Select[tuple[Any, ...]]` (represented as a fixed-length tuple of `Any`s).
+        returns a Select with one unknown value per selected entity.
         """
         call = ctx.context
         if not isinstance(call, CallExpr):
@@ -977,7 +978,7 @@ class SQLModelMypyPlugin(Plugin):
         any_t = _plugin_any()
         tuple_fallback = ctx.api.named_generic_type("builtins.tuple", [any_t])
         row_type = TupleType([any_t] * positional_count, tuple_fallback)
-        ret_type = Instance(select_info, [row_type])
+        ret_type = self._instance_with_row_type(select_info, row_type)
 
         fallback = default_items[0].fallback if default_items else tuple_fallback
         arg_types = [any_t] * positional_count
@@ -990,7 +991,7 @@ class SQLModelMypyPlugin(Plugin):
 
         Our signature hook for 5+ args deliberately uses `Any` to avoid "no overload matches"
         errors. Here, once mypy has inferred argument expression types, we recover a more precise
-        `Select[tuple[...]]` element type for the common cases (models + column expressions).
+        row element types for the common cases (models + column expressions).
         """
         call = ctx.context
         if not isinstance(call, CallExpr):
@@ -1012,7 +1013,7 @@ class SQLModelMypyPlugin(Plugin):
         proper_default = get_proper_type(default)
         if not isinstance(proper_default, Instance) or not proper_default.args:
             return default
-        proper_row = get_proper_type(proper_default.args[0])
+        proper_row = get_proper_type(self._instance_row_type(proper_default, ctx.api))
         if not isinstance(proper_row, TupleType):
             return default
 
@@ -1036,7 +1037,7 @@ class SQLModelMypyPlugin(Plugin):
         any_t = _plugin_any()
         tuple_fallback = ctx.api.named_generic_type("builtins.tuple", [any_t])
         row_type = TupleType(items, tuple_fallback)
-        return Instance(proper_default.type, [row_type])
+        return self._instance_with_row_type(proper_default.type, row_type)
 
     def _sqlmodel_select_entity_result_type(self, typ: Type) -> Type:
         """Return the value type produced by an entity passed to `select(...)`.
@@ -1054,6 +1055,9 @@ class SQLModelMypyPlugin(Plugin):
             return UnionType.make_union(
                 [self._sqlmodel_select_entity_result_type(item) for item in proper.items]
             )
+        if isinstance(proper, FunctionLike) and proper.is_type_obj():
+            # Mypy represents a model class expression by its constructor overloads.
+            return UnionType.make_union([item.ret_type for item in proper.items])
         if isinstance(proper, TypeType):
             item = get_proper_type(proper.item)
             if isinstance(item, Instance):
@@ -1371,6 +1375,23 @@ class SQLModelMypyPlugin(Plugin):
         coro = _named_generic_type_or_none(ctx.api, "typing.Coroutine", [any_t, any_t, result_type])
         return coro or default
 
+    @staticmethod
+    def _instance_row_type(instance: Instance, api: Any) -> Type:
+        """Read a row from SQLAlchemy 2.0's tuple or 2.1's variadic arguments."""
+        if instance.type.has_type_var_tuple_type:
+            tuple_fallback = api.named_generic_type("builtins.tuple", [_plugin_any()])
+            return TupleType(list(instance.args), tuple_fallback)
+        return instance.args[0]
+
+    @staticmethod
+    def _instance_with_row_type(info: TypeInfo, row_type: Type) -> Instance:
+        """Use the installed class's generic shape, without guessing package versions."""
+        if info.has_type_var_tuple_type:
+            proper_row = get_proper_type(row_type)
+            args = proper_row.items if isinstance(proper_row, TupleType) else [UnpackType(row_type)]
+            return Instance(info, args)
+        return Instance(info, [row_type])
+
     def _row_tuple_type_from_typed_statement(self, statement: Type, api: Any) -> Type | None:
         """Infer the row tuple type produced by a SQL statement (best-effort)."""
         proper = get_proper_type(statement)
@@ -1385,12 +1406,12 @@ class SQLModelMypyPlugin(Plugin):
             tuple_fallback = api.named_generic_type("builtins.tuple", [any_t])
             return TupleType([scalar_t], tuple_fallback)
 
-        # SQLModel Select[T] and SQLAlchemy Select[_TP] both store the row parameter in the first type argument.
+        # SQLAlchemy 2.1 and SQLModel 0.0.48 use variadic row parameters.
         if proper.type.fullname in {
             SQLMODEL_SELECT_CLS_FULLNAME,
             SQLALCHEMY_SELECT_FULLNAME,
         } or proper.type.has_base(SQLALCHEMY_SELECT_FULLNAME):
-            return proper.args[0]
+            return self._instance_row_type(proper, api)
 
         return None
 
@@ -1399,11 +1420,10 @@ class SQLModelMypyPlugin(Plugin):
         for fullname in ("sqlalchemy.engine.Result", "sqlalchemy.engine.result.Result"):
             inst = _named_generic_type_or_none(api, fullname, [row_tuple_type])
             if inst is not None:
-                return inst
+                return self._instance_with_row_type(inst.type, row_tuple_type)
             info = _lookup_typeinfo(self, fullname)
             if info is not None:
-                args = [row_tuple_type] * len(info.defn.type_vars)
-                return Instance(info, args)
+                return self._instance_with_row_type(info, row_tuple_type)
         return None
 
     def _sqlalchemy_select_join_return_type_callback(self, ctx: MethodContext) -> Type:
@@ -1661,7 +1681,7 @@ class SQLModelMypyPlugin(Plugin):
         if not receiver.args:
             return ctx.default_return_type
 
-        tp = get_proper_type(receiver.args[0])
+        tp = get_proper_type(self._instance_row_type(receiver, ctx.api))
         if not isinstance(tp, TupleType):
             return ctx.default_return_type
 
@@ -1682,7 +1702,7 @@ class SQLModelMypyPlugin(Plugin):
             return ctx.default_return_type
 
         new_tp = tp.copy_modified(items=new_items)
-        return Instance(receiver.type, [new_tp])
+        return self._instance_with_row_type(receiver.type, new_tp)
 
     def _sqlmodel_class_attr_type_callback(self, ctx: AttributeContext) -> Type:
         if ctx.is_lvalue:

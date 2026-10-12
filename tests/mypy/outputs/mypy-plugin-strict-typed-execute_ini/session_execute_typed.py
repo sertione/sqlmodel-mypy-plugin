@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from sqlalchemy.engine.result import Result
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -16,7 +15,9 @@ with Session(engine) as session:
     result = session.execute(select(Hero))
 
     # When `typed_execute=true`, `execute(select(Model))` should not degrade to `Result[Any]`.
-    ok_result: Result[tuple[Hero]] = result
+    row = result.one()
+    ok_row_hero: Hero = row[0]
+    bad_row_bool: bool = row[0]
 
     ok_hero: Hero = result.scalars().one()
     bad_bool: bool = result.scalars().one()
@@ -33,3 +34,12 @@ async def async_execute(session: AsyncSession) -> None:
     _ok_hero2: Hero = result3.scalars().one()
     _bad_bool2: bool = result3.scalars().one()
 # MYPY: error: Incompatible types in assignment (expression has type "Hero", variable has type "bool")  [assignment]
+
+
+async def async_execute_columns(session: AsyncSession) -> None:
+    result = await session.execute(select(Hero.id, Hero.name))
+    for hero_id, hero_name in result:
+        ok_id: int | None = hero_id
+        ok_name: str = hero_name
+        bad_id: int = hero_id
+        bad_name: int = hero_name
