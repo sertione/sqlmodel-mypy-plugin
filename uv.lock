@@ -975,7 +975,7 @@ wheels = [
 
 [[package]]
 name = "sqlmodel-mypy-plugin"
-version = "0.20.0"
+version = "0.21.2"
 source = { editable = "." }
 dependencies = [
     { name = "mypy" },
