@@ -29,7 +29,7 @@ from mypy.nodes import (
     TypeInfo,
     Var,
 )
-from mypy.types import AnyType, Instance, NoneType, TypeOfAny, TypeVarId, TypeVarType
+from mypy.types import AnyType, Instance, NoneType, TypeAliasType, TypeOfAny, TypeVarId, TypeVarType
 
 from sqlmodel_mypy.transform import (
     ERROR_FIELD,
@@ -1478,3 +1478,35 @@ def test_collect_fields_includes_if_blocks_and_inherited_metadata() -> None:
 
     # Ensure we recorded plugin dependency on the base
     assert any("m.Base" in dep for dep in api.dependencies)
+
+
+def test_force_invariant_type_vars_preserves_recursive_alias_graph() -> None:
+    alias = TypeAlias(AnyType(TypeOfAny.explicit), "m.JsonObject", "m", 1, 0)
+    recursive = TypeAliasType(alias, [])
+    cls = ClassDef("list", Block([]))
+    info = TypeInfo(SymbolTable(), cls, "builtins")
+    cls.info = info
+    alias.target = Instance(info, [recursive])
+
+    translated = recursive.accept(ForceInvariantTypeVars())
+
+    assert isinstance(translated, TypeAliasType)
+    assert translated.alias is alias
+    assert alias.target.args[0] is recursive
+
+
+def test_force_invariant_type_vars_translates_alias_arguments_without_mutating_definition() -> None:
+    tv = TypeVarType(
+        "T", "T", TypeVarId(19), [], AnyType(TypeOfAny.explicit), AnyType(TypeOfAny.explicit), 1
+    )
+    alias = TypeAlias(tv, "m.Value", "m", 1, 0, alias_tvars=[tv])
+    generic_alias = TypeAliasType(alias, [tv])
+
+    translated = generic_alias.accept(ForceInvariantTypeVars())
+
+    assert isinstance(translated, TypeAliasType)
+    assert translated.alias is alias
+    assert isinstance(translated.args[0], TypeVarType)
+    assert translated.args[0].variance == INVARIANT
+    assert tv.variance == 1
+    assert alias.target is tv

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -56,6 +57,7 @@ cases: list[tuple[str, str]] = [
     ("mypy-plugin.ini", "model_construct.py"),
     ("mypy-plugin-strict.ini", "model_construct.py"),
     ("mypy-plugin-strict.ini", "generics.py"),
+    ("mypy-plugin-strict.ini", "recursive_aliases.py"),
     ("mypy-plugin.ini", "expressions.py"),
     ("mypy-plugin-strict-no-explicit-any.ini", "expression_typing_strict.py"),
     ("mypy-plugin.ini", "label.py"),
@@ -91,6 +93,10 @@ cases: list[tuple[str, str]] = [
     ("mypy-plugin-strict.ini", "tuple_expression.py"),
 ]
 
+
+# Python's AST parser needs 3.12+ for PEP 695; the legacy equivalent runs everywhere.
+if sys.version_info >= (3, 12):
+    cases.append(("mypy-plugin-recursive.ini", "recursive_aliases_pep695.py"))
 
 # SQLAlchemy 2.1's variadic row API is exercised through both ORM and Core.
 if VARIADIC_ROWS:
