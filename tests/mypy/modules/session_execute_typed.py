@@ -36,7 +36,7 @@ async def async_execute(session: AsyncSession) -> None:
 async def async_execute_columns(session: AsyncSession) -> None:
     result = await session.execute(select(Hero.id, Hero.name))
     for hero_id, hero_name in result:
-        ok_id: int | None = hero_id
-        ok_name: str = hero_name
-        bad_id: int = hero_id
-        bad_name: int = hero_name
+        _ok_id: int | None = hero_id
+        _ok_name: str = hero_name
+        _bad_id: int = hero_id
+        _bad_name: int = hero_name

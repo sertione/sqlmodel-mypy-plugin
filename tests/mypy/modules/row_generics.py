@@ -19,7 +19,7 @@ engine = create_engine("sqlite://")
 # The 5+ entity fallback and outer-join nullability must compose.
 statement = select(Hero, Team, Hero.id, Team.id, Hero.name).outerjoin(Team)
 with Session(engine) as session:
-    for hero, team, hero_id, team_id, name in session.exec(statement):
+    for hero, team, hero_id, _team_id, name in session.exec(statement):
         ok_hero: Hero = hero
         ok_team: Team | None = team
         ok_id: int | None = hero_id
@@ -30,7 +30,7 @@ with Session(engine) as session:
 
 # A SQLModel select must preserve column arity when executed on a Core connection.
 with engine.connect() as connection:
-    for hero_id2, name2, team_id2, team_name2, repeated_id in connection.execute(
+    for hero_id2, name2, _team_id2, _team_name2, _repeated_id in connection.execute(
         select(Hero.id, Hero.name, Hero.team_id, Team.name, Hero.id)
     ):
         ok_name2: str = name2
